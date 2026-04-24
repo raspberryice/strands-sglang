@@ -100,12 +100,26 @@ class SGLangModel(Model):
 
         # State tracking (this makes SGLangModel stateful)
         self.token_manager = TokenManager()
-        self.routed_experts: str | None = None  # base64-encoded MoE expert indices (flat int32)
+        # One base64 MoE expert-index payload per `stream()` call. Ordered by call.
+        self.routed_experts_per_call: list[str] = []
+        # One `meta_info["weight_version"]` per `stream()` call (may span multiple
+        # checkpoint versions for multi-turn episodes under mid-episode weight sync).
+        self.weight_versions: list[str] = []
         self.message_count: int = 0
         self.tool_parse_errors: dict[str, int] = {}  # per-tool parse error count
         self.image_data: list[str] = []  # accumulated image data URLs (VLM only)
 
         logger.debug("initialized with config: %s", self.config)
+
+    @property
+    def routed_experts(self) -> str | None:
+        """Last call's base64 MoE expert-index payload.
+
+        Kept for backward compatibility with pre-list callers (including
+        `strands_env.core.environment.Environment.step`). New code should
+        read `routed_experts_per_call` to reconstruct multi-turn routing.
+        """
+        return self.routed_experts_per_call[-1] if self.routed_experts_per_call else None
 
     def reset(self) -> None:
         """Reset all state for a new episode."""
@@ -113,7 +127,8 @@ class SGLangModel(Model):
         self.message_count = 0
         self.tool_parse_errors = {}
         self.image_data = []
-        self.routed_experts = None
+        self.routed_experts_per_call = []
+        self.weight_versions = []
 
     # -------------------------------------------------------------------------
     # Model interface implementation
@@ -380,10 +395,15 @@ class SGLangModel(Model):
             token_ids=output_ids,
             logprobs=[e[0] for e in output_token_logprobs] if output_token_logprobs else None,
         )
-        # Update routed experts for R3
+        # Append routed experts for R3 (one entry per call; ordered).
         # TODO: pass routed_experts_start_len (like logprob_start_len) once SGLang wires it up,
         # to avoid receiving the full-sequence payload on every multi-turn call.
-        self.routed_experts = meta_info["routed_experts"] if return_routed_experts else None
+        if return_routed_experts:
+            self.routed_experts_per_call.append(meta_info["routed_experts"])
+        # Append the server's reported weight version for staleness tracking.
+        weight_version = meta_info.get("weight_version")
+        if weight_version is not None:
+            self.weight_versions.append(weight_version)
         # Update message count
         self.message_count = len(messages) + 1
 
