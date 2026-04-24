@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar
 from typing import Any
 
 import aiohttp
@@ -30,6 +31,12 @@ from .exceptions import (
     SGLangHTTPError,
     SGLangThrottledError,
 )
+
+# Per-task extra headers forwarded to `/generate`. Set with `request_headers.set(...)`
+# in the calling task (e.g., by Slime's agent bridge to pin trajectories to workers
+# via X-Slime-Trajectory-Id). None = no extra headers. Inherits per-task isolation
+# from asyncio so concurrent episodes can set different headers safely.
+request_headers: ContextVar[dict[str, str] | None] = ContextVar("sglang_request_headers", default=None)
 
 logger = logging.getLogger(__name__)
 
@@ -202,10 +209,11 @@ class SGLangClient:
 
         last_error: Exception | None = None
         session = self._get_session()
+        extra_headers = request_headers.get()
 
         for attempt in range(self.max_retries + 1):
             try:
-                async with session.post("/generate", json=payload) as resp:
+                async with session.post("/generate", json=payload, headers=extra_headers) as resp:
                     if resp.status >= 400:
                         body = await resp.text()
                         raise self._classify_http_error(resp.status, body)
