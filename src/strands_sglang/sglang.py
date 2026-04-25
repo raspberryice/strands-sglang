@@ -368,6 +368,13 @@ class SGLangModel(Model):
                 return_logprob=return_logprob,
                 logprob_start_len=max(0, len(self.token_manager.token_ids) - 1) if return_logprob else None,
                 return_routed_experts=return_routed_experts,
+                # Mirror logprob_start_len: ask SGLang for routing only for positions
+                # newly introduced by this call. Avoids the O(N²) wire cost of
+                # re-sending the full cumulative sequence's routing on every multi-turn
+                # call. Server-side support added in our SGLang fork on `slime-slim`.
+                routed_experts_start_len=(
+                    max(0, len(self.token_manager.token_ids) - 1) if return_routed_experts else 0
+                ),
                 image_data=self.image_data or None,
             )
 
@@ -396,8 +403,9 @@ class SGLangModel(Model):
             logprobs=[e[0] for e in output_token_logprobs] if output_token_logprobs else None,
         )
         # Append routed experts for R3 (one entry per call; ordered).
-        # TODO: pass routed_experts_start_len (like logprob_start_len) once SGLang wires it up,
-        # to avoid receiving the full-sequence payload on every multi-turn call.
+        # Each payload covers only the positions introduced by this call (because we
+        # passed `routed_experts_start_len` above). The bridge can concat per-call
+        # payloads directly without per-turn slicing.
         if return_routed_experts:
             self.routed_experts_per_call.append(meta_info["routed_experts"])
         # Append the server's reported weight version for staleness tracking.
