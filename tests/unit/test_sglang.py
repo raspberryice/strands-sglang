@@ -303,11 +303,19 @@ class TestStreamRoutedExperts:
         assert decoded.shape == (seq_len - 1, num_layers, top_k)
         np.testing.assert_array_equal(decoded.ravel(), experts)
 
-    async def test_raises_when_not_in_response(self, mock_tokenizer):
-        """stream() raises KeyError when return_routed_experts=True but server omits it."""
+    async def test_appends_none_when_server_omits(self, mock_tokenizer):
+        """stream() appends None when the server omits `routed_experts` from meta_info.
+
+        SGLang's tokenizer_manager omits the key on edge paths (idle/retraction
+        batches, mixed-batch gating). We tolerate that here so the trajectory
+        survives; the bridge's reconstruction path will detect the None and
+        either skip routing replay (`--agent-routing-replay-skip-on-mismatch`)
+        or mask the sample.
+        """
         model, _ = _make_model_with_mock_client(mock_tokenizer, return_routed_experts=True)
 
         messages = [{"role": "user", "content": [{"text": "hi"}]}]
-        with pytest.raises(KeyError, match="routed_experts"):
-            async for _ in model.stream(messages):
-                pass
+        async for _ in model.stream(messages):
+            pass
+
+        assert model.routed_experts_per_call == [None]

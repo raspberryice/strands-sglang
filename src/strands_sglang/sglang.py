@@ -406,8 +406,11 @@ class SGLangModel(Model):
         # Each payload covers only the positions introduced by this call (because we
         # passed `routed_experts_start_len` above). The bridge can concat per-call
         # payloads directly without per-turn slicing.
+        # Use .get() to tolerate the server occasionally omitting the key on edge
+        # paths (idle/retraction batches); the bridge's reconstruction asserts on
+        # None payloads and falls through to skip-on-mismatch when enabled.
         if return_routed_experts:
-            self.routed_experts_per_call.append(meta_info["routed_experts"])
+            self.routed_experts_per_call.append(meta_info.get("routed_experts"))
         # Append the server's reported weight version for staleness tracking.
         weight_version = meta_info.get("weight_version")
         if weight_version is not None:
