@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextvars import ContextVar
 from typing import Any
 
@@ -37,6 +38,13 @@ from .exceptions import (
 # via X-Slime-Trajectory-Id). None = no extra headers. Inherits per-task isolation
 # from asyncio so concurrent episodes can set different headers safely.
 request_headers: ContextVar[dict[str, str] | None] = ContextVar("sglang_request_headers", default=None)
+
+# Per-task `time.monotonic()` deadline that bounds the retry budget for `/generate`
+# calls. Set by the caller (e.g., Slime's agent bridge) to `time.monotonic() +
+# trajectory_timeout` once per trajectory; the retry loop checks it before each
+# attempt and bails with `SGLangConnectionError` rather than burning the rest of
+# the trajectory budget on retries. None = no deadline (legacy behavior).
+request_deadline: ContextVar[float | None] = ContextVar("sglang_request_deadline", default=None)
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +109,8 @@ class SGLangClient:
             timeout: Request timeout in seconds, or None for infinite (default: 900.0).
             connect_timeout: TCP connection timeout in seconds (default: 5s).
             max_retries: Maximum retry attempts on transient errors (default: 60, like slime).
+                Callers that want trajectory-aware bail-out should set the
+                `request_deadline` ContextVar to cap retries by wall-clock.
             retry_delay: Delay between retries in seconds (default: 1.0).
         """
         self.base_url = base_url.rstrip("/")
@@ -210,6 +220,7 @@ class SGLangClient:
         last_error: Exception | None = None
         session = self._get_session()
         extra_headers = request_headers.get()
+        deadline = request_deadline.get()
 
         for attempt in range(self.max_retries + 1):
             try:
@@ -225,8 +236,17 @@ class SGLangClient:
                         # Non-JSON response — treat as retryable error
                         raise SGLangDecodingError(f"Invalid JSON response: {e}") from e
 
-            except (aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
-                last_error = SGLangConnectionError(str(e))
+            except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
+                # `ClientConnectionError` is the aiohttp parent of
+                # `ClientConnectorError`, `ClientOSError`, `ServerDisconnectedError`,
+                # and `ServerTimeoutError` — all connection-level failures that
+                # are retryable and worth a typed wrapper. `ClientPayloadError`
+                # (transient mid-response truncation) is a sibling under
+                # `ClientError`; folding it in here keeps these from falling
+                # through to the catch-all below where they'd surface as
+                # opaque `SGLangClientError("Server disconnected")` and get
+                # classified as `unclassified_error` downstream.
+                last_error = SGLangConnectionError(str(e) or type(e).__name__)
                 last_error.__cause__ = e
 
             except SGLangClientError as e:
@@ -241,9 +261,10 @@ class SGLangClient:
                 last_error = SGLangClientError(str(e))
                 last_error.__cause__ = e
 
-            # Log and retry
+            # Decide: retry, or bail (budget exhausted or deadline elapsed)
             error_detail = str(last_error)
-            if attempt < self.max_retries:
+            deadline_exceeded = deadline is not None and time.monotonic() >= deadline
+            if attempt < self.max_retries and not deadline_exceeded:
                 logger.warning(
                     "SGLang request failed (attempt %d/%d): %s: %s. Retrying in %ss...",
                     attempt + 1,
@@ -254,12 +275,22 @@ class SGLangClient:
                 )
                 await asyncio.sleep(self.retry_delay)
             else:
-                logger.error(
-                    "SGLang request failed after %d attempts: %s: %s",
-                    self.max_retries + 1,
-                    type(last_error).__name__,
-                    error_detail,
-                )
+                if deadline_exceeded:
+                    logger.error(
+                        "SGLang request failed (attempt %d/%d): %s: %s. "
+                        "Trajectory deadline exceeded; not retrying.",
+                        attempt + 1,
+                        self.max_retries + 1,
+                        type(last_error).__name__,
+                        error_detail,
+                    )
+                else:
+                    logger.error(
+                        "SGLang request failed after %d attempts: %s: %s",
+                        self.max_retries + 1,
+                        type(last_error).__name__,
+                        error_detail,
+                    )
                 raise last_error
 
         raise RuntimeError("Unreachable: loop must return or raise")

@@ -15,6 +15,7 @@
 """Unit tests for SGLangClient (mocked, no server required)."""
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -337,6 +338,29 @@ class TestGenerateErrors:
         with pytest.raises(SGLangConnectionError):
             await client.generate(input_ids=[1, 2, 3])
 
+    async def test_connection_error_on_server_disconnected(self):
+        """aiohttp.ServerDisconnectedError is wrapped in SGLangConnectionError.
+
+        Regression test for the upstream-classification bug where a mid-stream
+        server disconnect surfaced as an opaque `SGLangClientError("Server
+        disconnected")` (caught by the catch-all `except Exception`) rather
+        than the typed connection-error wrapper. Without the typed wrapper,
+        downstream `TerminationReason.from_error` classifies the failure as
+        `unclassified_error` instead of `connection_error`, and W&B metrics
+        lose the signal.
+        """
+        client = _client_with_mock_session(side_effect=aiohttp.ServerDisconnectedError())
+
+        with pytest.raises(SGLangConnectionError):
+            await client.generate(input_ids=[1, 2, 3])
+
+    async def test_connection_error_on_payload_error(self):
+        """aiohttp.ClientPayloadError is wrapped in SGLangConnectionError (transient)."""
+        client = _client_with_mock_session(side_effect=aiohttp.ClientPayloadError("truncated"))
+
+        with pytest.raises(SGLangConnectionError):
+            await client.generate(input_ids=[1, 2, 3])
+
     async def test_decoding_error_on_invalid_json(self):
         """Non-JSON success response raises SGLangDecodingError."""
         resp = _mock_response(200, body="<html>not json</html>")
@@ -387,6 +411,56 @@ class TestGenerateErrors:
 
         # Should only be called once — no retries
         assert mock_session.post.call_count == 1
+
+    @patch("strands_sglang.client.asyncio.sleep", new_callable=AsyncMock)
+    async def test_retry_loop_bails_on_expired_deadline(self, mock_sleep):
+        """When request_deadline is in the past, retries stop after the first failure.
+
+        The retry budget must be bounded by the trajectory wall-clock
+        deadline. With a generous max_retries but an already-expired
+        deadline, only one attempt should be made.
+        """
+        from strands_sglang.client import request_deadline
+
+        error_resp = _mock_response(500, body="Internal server error")
+        client = SGLangClient(base_url="http://localhost:30000", max_retries=10, retry_delay=0.0)
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=error_resp)
+        client._get_session = MagicMock(return_value=mock_session)
+
+        token = request_deadline.set(time.monotonic() - 1.0)  # already in the past
+        try:
+            with pytest.raises(SGLangHTTPError) as exc_info:
+                await client.generate(input_ids=[1, 2, 3])
+        finally:
+            request_deadline.reset(token)
+
+        assert exc_info.value.status == 500
+        # Deadline was already in the past — the first attempt runs, then bail
+        assert mock_session.post.call_count == 1
+        # And we should NOT have slept (deadline check fires before the sleep)
+        mock_sleep.assert_not_called()
+
+    @patch("strands_sglang.client.asyncio.sleep", new_callable=AsyncMock)
+    async def test_retry_loop_proceeds_when_deadline_in_future(self, mock_sleep):
+        """A future deadline does not interfere with normal retry behavior."""
+        from strands_sglang.client import request_deadline
+
+        error_resp = _mock_response(500, body="Internal server error")
+        success_resp = _mock_response(200, json_data={"text": "ok", "output_ids": [], "meta_info": {}})
+        client = SGLangClient(base_url="http://localhost:30000", max_retries=2, retry_delay=0.0)
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(side_effect=[error_resp, success_resp])
+        client._get_session = MagicMock(return_value=mock_session)
+
+        token = request_deadline.set(time.monotonic() + 60.0)
+        try:
+            result = await client.generate(input_ids=[1, 2, 3])
+        finally:
+            request_deadline.reset(token)
+
+        assert result["text"] == "ok"
+        assert mock_session.post.call_count == 2
 
 
 class TestExceptionHierarchy:
