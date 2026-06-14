@@ -319,3 +319,36 @@ class TestStreamRoutedExperts:
             pass
 
         assert model.routed_experts_per_call == [None]
+
+
+class TestStreamUsageMetadata:
+    """Tests for usage-metadata tolerance when the server omits usage keys."""
+
+    async def test_tolerates_missing_usage_keys(self, mock_tokenizer):
+        """stream() must not raise when meta_info omits the usage keys.
+
+        On the max_tokens / aborted-stream recovery path SGLang returns a
+        meta_info with `finish_reason` present but the usage keys
+        (prompt_tokens / completion_tokens / cached_tokens / e2e_latency)
+        absent. A hard subscript raised KeyError mid-stream, which propagated
+        as an `unclassified_error` termination and silently downgraded an
+        otherwise TRUNCATED (trainable) max_tokens trajectory to ABORTED. The
+        usage fields are telemetry only, so we default them to 0.
+        """
+        # finish_reason present (type "length" = the max_tokens path), usage keys gone.
+        response = _make_generate_response(meta_info={"finish_reason": {"type": "length"}})
+        model, _ = _make_model_with_mock_client(mock_tokenizer, generate_return=response)
+
+        messages = [{"role": "user", "content": [{"text": "hi"}]}]
+        events = [event async for event in model.stream(messages)]
+
+        usage = next(e["metadata"]["usage"] for e in events if "metadata" in e)
+        assert usage == {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "totalTokens": 0,
+            "cacheReadInputTokens": 0,
+        }
+        # and the length finish_reason still maps to a max_tokens stop
+        stop = next(e["messageStop"]["stopReason"] for e in events if "messageStop" in e)
+        assert stop == "max_tokens"

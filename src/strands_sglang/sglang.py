@@ -438,16 +438,25 @@ class SGLangModel(Model):
             stop_reason = "max_tokens"
         yield {"messageStop": {"stopReason": cast(StopReason, stop_reason)}}
 
-        # Assistant message usage metadata
+        # Assistant message usage metadata. Use .get() with defaults: on edge
+        # paths (notably the max_tokens / aborted-stream recovery path) SGLang
+        # omits the usage keys from meta_info even though finish_reason is present
+        # — same server behaviour the routed_experts/.get() above tolerates. A
+        # hard subscript here raised KeyError mid-stream, which propagated as an
+        # `unclassified_error` termination and silently downgraded an otherwise
+        # TRUNCATED (trainable) max_tokens trajectory to ABORTED. These fields are
+        # telemetry only (no training-gradient impact), so 0-defaults are safe.
+        prompt_tokens = meta_info.get("prompt_tokens", 0)
+        completion_tokens = meta_info.get("completion_tokens", 0)
         yield {
             "metadata": {
                 "usage": {
-                    "inputTokens": meta_info["prompt_tokens"],
-                    "outputTokens": meta_info["completion_tokens"],
-                    "totalTokens": meta_info["prompt_tokens"] + meta_info["completion_tokens"],
-                    "cacheReadInputTokens": meta_info["cached_tokens"],
+                    "inputTokens": prompt_tokens,
+                    "outputTokens": completion_tokens,
+                    "totalTokens": prompt_tokens + completion_tokens,
+                    "cacheReadInputTokens": meta_info.get("cached_tokens", 0),
                 },
-                "metrics": {"latencyMs": int(meta_info["e2e_latency"] * 1000)},
+                "metrics": {"latencyMs": int(meta_info.get("e2e_latency", 0.0) * 1000)},
             }
         }
 
