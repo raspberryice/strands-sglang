@@ -43,7 +43,8 @@ class QwenXMLToolParser(ToolParser):
 
     Notes:
         - Function and parameter names are embedded in tag attributes.
-        - Think blocks are excluded to avoid parsing draft tool calls from reasoning.
+        - Only content after a complete ``</think>`` is parsed, so draft tool
+          calls drawn up during reasoning are never surfaced (see ``parse``).
     """
 
     _FUNCTION_PATTERN = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
@@ -51,9 +52,22 @@ class QwenXMLToolParser(ToolParser):
 
     @override
     def parse(self, text: str) -> list[ToolParseResult]:
-        """Parse tool calls from model output."""
-        # Remove think blocks to avoid parsing draft tool calls from reasoning
-        text = self.think_pattern.sub("", text)
+        """Parse tool calls from model output.
+
+        Only content emitted *after* a complete ``</think>`` is parsed. Qwen
+        thinking models seed the opening ``<think>`` in the prompt, so model
+        output is ``reasoning… </think> answer`` — the opening tag is usually
+        absent from ``text`` and a complete block can't be matched by removal.
+        Keying off the closing tag: take only what follows the first
+        ``</think>``; if there is no close, the whole output is still
+        reasoning, so parse nothing (avoids surfacing draft tool calls the
+        model drew up mid-thought but never committed to).
+        """
+        end = self.think_end_token
+        if end in text:
+            text = text.split(end, 1)[1]  # content = post-</think> only
+        else:
+            text = ""  # no close => all reasoning => no tool calls
 
         tool_calls: list[ToolParseResult] = []
 

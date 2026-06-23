@@ -175,7 +175,13 @@ class TestQwenXMLToolParser:
         return QwenXMLToolParser()
 
     def test_parse_single_tool_call(self, parser):
-        text = """<tool_call>
+        # Real Qwen output always carries a </think> — generated in thinking
+        # mode, template-injected (empty) in no-thinking mode. Only the
+        # post-</think> region is parsed.
+        text = """<think>
+
+</think>
+<tool_call>
 <function=calculator>
 <parameter=x>1</parameter>
 <parameter=y>2</parameter>
@@ -190,7 +196,9 @@ class TestQwenXMLToolParser:
 
     def test_parse_multiple_tool_calls_with_sequential_ids(self, parser):
         """Multiple calls get sequential call_NNNN IDs."""
-        text = """
+        text = """<think>
+
+</think>
 <tool_call><function=tool_a><parameter=a>1</parameter></function></tool_call>
 <tool_call><function=tool_b><parameter=b>2</parameter></function></tool_call>
 <tool_call><function=tool_c></function></tool_call>
@@ -206,7 +214,10 @@ class TestQwenXMLToolParser:
         assert parser.parse("") == []
 
     def test_parse_multiline_parameter_value(self, parser):
-        text = """<tool_call>
+        text = """<think>
+
+</think>
+<tool_call>
 <function=write_file>
 <parameter=path>/tmp/test.py</parameter>
 <parameter=content>
@@ -221,7 +232,10 @@ def hello():
         assert "def hello():" in results[0].input["content"]
 
     def test_parse_missing_function_tag(self, parser):
-        text = """<tool_call>
+        text = """<think>
+
+</think>
+<tool_call>
 <parameter=x>1</parameter>
 </tool_call>"""
         results = parser.parse(text)
@@ -242,8 +256,14 @@ def hello():
         assert results[0].name == "actual"
 
     def test_real_world_git_status_example(self, parser):
-        """Parse real-world example from Qwen3-Coder."""
-        text = """I'll check the git status for you.
+        """Real-world example from Qwen3-Coder in no-thinking mode — the chat
+        template injects an empty <think></think>, so a </think> is present
+        and the tool call after it still parses."""
+        text = """<think>
+
+</think>
+
+I'll check the git status for you.
 
 <tool_call>
 <function=run_terminal_command>
@@ -260,6 +280,45 @@ True
         assert results[0].name == "run_terminal_command"
         assert results[0].input["command"] == "git status"
         assert results[0].input["waitForCompletion"] == "True"
+
+    def test_unclosed_think_yields_no_calls(self, parser):
+        """Reasoning that never closes (e.g. truncated mid-thought) → no tool
+        calls, even when a draft call appears inside it. Qwen seeds the opening
+        <think> in the prompt, so the output has no think tokens at all here."""
+        text = (
+            "Let me try this.\n"
+            "<tool_call><function=draft><parameter=x>1</parameter></function></tool_call>\n"
+            "hmm, still thinking..."
+        )
+        assert parser.parse(text) == []
+
+    def test_draft_before_close_ignored_real_after_parsed(self, parser):
+        """A draft call before </think> is dropped; only the post-close call is
+        parsed — and with no opening <think> in the output (it's in the prompt)."""
+        text = (
+            "reasoning...\n"
+            "<tool_call><function=draft><parameter=x>1</parameter></function></tool_call>\n"
+            "</think>\n"
+            "<tool_call><function=actual><parameter=y>2</parameter></function></tool_call>"
+        )
+        results = parser.parse(text)
+
+        assert len(results) == 1
+        assert results[0].name == "actual"
+        assert results[0].input == {"y": 2}
+
+    def test_splits_on_first_think_close(self, parser):
+        """Only the FIRST </think> ends reasoning; anything after it is parsed,
+        including a later stray </think> (treated as plain text)."""
+        text = (
+            "draft</think>"
+            "<tool_call><function=a><parameter=x>1</parameter></function></tool_call>"
+            "</think>"
+            "<tool_call><function=b><parameter=y>2</parameter></function></tool_call>"
+        )
+        results = parser.parse(text)
+
+        assert [r.name for r in results] == ["a", "b"]
 
 
 class TestGLMToolParser:
