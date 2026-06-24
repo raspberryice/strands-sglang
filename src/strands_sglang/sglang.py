@@ -41,7 +41,7 @@ from transformers import PreTrainedTokenizerBase
 from typing_extensions import Unpack, override
 
 from .client import SGLangClient
-from .exceptions import SGLangContextLengthError, SGLangThrottledError
+from .exceptions import GenerationAbortedException, SGLangContextLengthError, SGLangThrottledError
 from .token import TokenManager
 from .tool_parsers import HermesToolParser, ToolParser
 
@@ -105,6 +105,11 @@ class SGLangModel(Model):
         # One `meta_info["weight_version"]` per `stream()` call (may span multiple
         # checkpoint versions for multi-turn episodes under mid-episode weight sync).
         self.weight_versions: list[str] = []
+        # One `meta_info["finish_reason"]["type"]` per `stream()` call, ordered.
+        # Telemetry for the bridge's logging_info; the trailing entry also drives
+        # the `abort` -> ABORTED relabel below (a partial returned by a weight-sync
+        # `pause_generation(mode="abort")` must not train as a reward-0 completion).
+        self.finish_reasons: list[str | None] = []
         self.message_count: int = 0
         self.tool_parse_errors: dict[str, int] = {}  # per-tool parse error count
         self.image_data: list[str] = []  # accumulated image data URLs (VLM only)
@@ -129,6 +134,7 @@ class SGLangModel(Model):
         self.image_data = []
         self.routed_experts_per_call = []
         self.weight_versions = []
+        self.finish_reasons = []
 
     # -------------------------------------------------------------------------
     # Model interface implementation
@@ -415,6 +421,12 @@ class SGLangModel(Model):
         weight_version = meta_info.get("weight_version")
         if weight_version is not None:
             self.weight_versions.append(weight_version)
+        # Record the server's finish_reason type for this call (telemetry +
+        # the abort relabel at the stop-reason branch below). One entry per
+        # `stream()` call, ordered. `.get()` chain tolerates the rare edge
+        # path where the key is absent.
+        finish_reason_type = (meta_info.get("finish_reason") or {}).get("type")
+        self.finish_reasons.append(finish_reason_type)
         # Update message count
         self.message_count = len(messages) + 1
 
@@ -434,8 +446,24 @@ class SGLangModel(Model):
 
         # Assistant message stop
         stop_reason: str = "tool_use" if parsed_tool_calls else "end_turn"
-        if meta_info["finish_reason"]["type"] == "length":
+        if finish_reason_type == "length":
             stop_reason = "max_tokens"
+        elif finish_reason_type == "abort":
+            # The server aborted this in-flight /generate and returned a partial
+            # (HTTP 200, finish_reason="abort") — almost always a weight-sync
+            # `pause_generation(mode="abort")` in fully-async rollout. The partial
+            # is incomplete and off-policy, so we must NOT surface it as a clean
+            # `end_turn`: strands would map that to TASK_COMPLETE and the bridge
+            # would train it as a reward-0 "no submission" (the no_submission_ratio
+            # inflation diagnosed in the stage-1 curriculum log). Raise instead so
+            # `TerminationReason.from_error` -> GENERATION_ABORTED -> the bridge
+            # marks the sample ABORTED (neutralized + retried). `token_manager` and
+            # `finish_reasons` are already updated above, so partial-state
+            # diagnostics survive.
+            raise GenerationAbortedException(
+                f"SGLang aborted generation mid-stream (finish_reason=abort; "
+                f"{len(output_ids)} partial output tokens)"
+            )
         yield {"messageStop": {"stopReason": cast(StopReason, stop_reason)}}
 
         # Assistant message usage metadata. Use .get() with defaults: on edge

@@ -20,7 +20,7 @@ import numpy as np
 import pybase64
 import pytest
 
-from strands_sglang import SGLangModel
+from strands_sglang import GenerationAbortedException, SGLangModel
 from strands_sglang.client import SGLangClient
 
 
@@ -352,3 +352,40 @@ class TestStreamUsageMetadata:
         # and the length finish_reason still maps to a max_tokens stop
         stop = next(e["messageStop"]["stopReason"] for e in events if "messageStop" in e)
         assert stop == "max_tokens"
+
+
+class TestStreamFinishReason:
+    """Tests for finish_reason recording and the abort relabel path."""
+
+    async def test_records_finish_reason_per_call(self, mock_tokenizer):
+        """stream() appends each call's finish_reason type to `finish_reasons`."""
+        model, _ = _make_model_with_mock_client(mock_tokenizer)  # default type "stop"
+
+        messages = [{"role": "user", "content": [{"text": "hi"}]}]
+        events = [event async for event in model.stream(messages)]
+
+        assert model.finish_reasons == ["stop"]
+        # A clean stop is still an end_turn (no raise).
+        stop = next(e["messageStop"]["stopReason"] for e in events if "messageStop" in e)
+        assert stop == "end_turn"
+
+    async def test_abort_finish_reason_raises(self, mock_tokenizer):
+        """stream() raises GenerationAbortedException on a finish_reason='abort' partial.
+
+        SGLang returns an HTTP-200 partial with finish_reason='abort' when it
+        aborts an in-flight /generate (e.g. a weight-sync
+        pause_generation(mode='abort')). Yielding it as a clean end_turn would
+        mislabel the partial as a reward-0 TASK_COMPLETE; raising routes it to
+        TerminationReason.GENERATION_ABORTED -> ABORTED (neutralized + retried).
+        """
+        response = _make_generate_response(meta_info={"finish_reason": {"type": "abort"}})
+        model, _ = _make_model_with_mock_client(mock_tokenizer, generate_return=response)
+
+        messages = [{"role": "user", "content": [{"text": "hi"}]}]
+        with pytest.raises(GenerationAbortedException):
+            async for _ in model.stream(messages):
+                pass
+
+        # Recorded BEFORE the raise so the bridge's logging_info + partial-state
+        # diagnostics survive the abort.
+        assert model.finish_reasons == ["abort"]

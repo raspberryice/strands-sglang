@@ -16,6 +16,7 @@
 
 from .client import SGLangClient
 from .exceptions import (
+    GenerationAbortedException,
     SGLangClientError,
     SGLangConnectionError,
     SGLangContextLengthError,
@@ -44,6 +45,7 @@ __all__ = [
     "SGLangThrottledError",
     "SGLangConnectionError",
     "SGLangDecodingError",
+    "GenerationAbortedException",
     # Model
     "SGLangModel",
     # Token management
