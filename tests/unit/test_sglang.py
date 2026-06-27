@@ -45,6 +45,20 @@ def model(mock_tokenizer):
     return model
 
 
+class TestPreserveThinking:
+    """preserve_thinking config threads into the chat-template kwargs (resume token alignment)."""
+
+    def test_default_off(self, mock_tokenizer):
+        client = SGLangClient(base_url="http://localhost:30000")
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        assert model._chat_template_kwargs["preserve_thinking"] is False
+
+    def test_enabled_flows_to_chat_template_kwargs(self, mock_tokenizer):
+        client = SGLangClient(base_url="http://localhost:30000")
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer, preserve_thinking=True)
+        assert model._chat_template_kwargs["preserve_thinking"] is True
+
+
 class TestFormatTools:
     """Tests for format_tool_specs method."""
 

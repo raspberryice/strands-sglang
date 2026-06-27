@@ -72,6 +72,7 @@ class SGLangModel(Model):
         return_logprob: bool | None  # Return logprobs for all tokens (default: True)
         return_routed_experts: bool | None  # Return MoE routed expert indices (default: False)
         enable_thinking: bool | None  # Enable thinking mode for Qwen3 hybrid models
+        preserve_thinking: bool | None  # Keep <think> in history turns on re-render (resume alignment)
 
     def __init__(
         self,
@@ -96,6 +97,10 @@ class SGLangModel(Model):
         self._chat_template_kwargs: dict[str, Any] = {
             "tokenize": False,
             "enable_thinking": self.config.get("enable_thinking", True),
+            # Keep <think> blocks in *history* turns when re-rendering a conversation (e.g. resuming
+            # an aborted trajectory). The Qwen3 template strips them by default, so a re-rendered
+            # prefix would diverge from the originally generated token stream.
+            "preserve_thinking": self.config.get("preserve_thinking", False),
         }
 
         # State tracking (this makes SGLangModel stateful)
