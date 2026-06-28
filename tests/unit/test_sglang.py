@@ -289,6 +289,37 @@ class TestStreamRoutedExperts:
 
         assert client.generate.call_args.kwargs["return_routed_experts"] is False
 
+
+class TestMaxTrajectoryTokens:
+    """The trajectory token budget clamps each turn's max_new_tokens to the remaining budget, and
+    truncates (ContextWindowOverflowException) once the cumulative prompt reaches it."""
+
+    async def test_clamps_max_new_tokens_to_remaining(self, mock_tokenizer):
+        # mock encode -> 5 input tokens; budget 8 -> remaining 3, so 50 clamps to 3.
+        model, client = _make_model_with_mock_client(
+            mock_tokenizer, sampling_params={"max_new_tokens": 50}, max_trajectory_tokens=8
+        )
+        async for _ in model.stream([{"role": "user", "content": [{"text": "hi"}]}]):
+            pass
+        assert client.generate.call_args.kwargs["sampling_params"]["max_new_tokens"] == 3
+
+    async def test_truncates_when_budget_reached(self, mock_tokenizer):
+        from strands.types.exceptions import ContextWindowOverflowException
+
+        model, client = _make_model_with_mock_client(
+            mock_tokenizer, sampling_params={"max_new_tokens": 50}, max_trajectory_tokens=3
+        )
+        with pytest.raises(ContextWindowOverflowException):
+            async for _ in model.stream([{"role": "user", "content": [{"text": "hi"}]}]):
+                pass
+        client.generate.assert_not_called()
+
+    async def test_off_by_default(self, mock_tokenizer):
+        model, client = _make_model_with_mock_client(mock_tokenizer, sampling_params={"max_new_tokens": 50})
+        async for _ in model.stream([{"role": "user", "content": [{"text": "hi"}]}]):
+            pass
+        assert client.generate.call_args.kwargs["sampling_params"]["max_new_tokens"] == 50
+
     async def test_stored_as_base64(self, mock_tokenizer):
         """stream() stores routed_experts as raw base64 string from meta_info."""
         experts_array = np.arange(36, dtype=np.int32)

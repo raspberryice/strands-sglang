@@ -73,6 +73,7 @@ class SGLangModel(Model):
         return_routed_experts: bool | None  # Return MoE routed expert indices (default: False)
         enable_thinking: bool | None  # Enable thinking mode for Qwen3 hybrid models
         preserve_thinking: bool | None  # Keep <think> in history turns on re-render (resume alignment)
+        max_trajectory_tokens: int | None  # Cap cumulative trajectory tokens (prompt+gen); None = off
 
     def __init__(
         self,
@@ -366,6 +367,22 @@ class SGLangModel(Model):
         )
         # Tracking token IDs in token_manager to ensure the token-in feature
         input_ids = self.token_manager.token_ids + new_input_ids
+
+        # Slime-side trajectory token budget: clamp this turn's max_new_tokens so the cumulative
+        # trajectory (prompt + all generation) never exceeds max_trajectory_tokens. The context cap
+        # is only applied to the initial prompt, so multi-turn trajectories -- especially resumes
+        # seeded with a long prefix -- otherwise grow unbounded toward the model's native context.
+        # None -> off (legacy). When the budget is reached, truncate the same way a real context
+        # overflow does (TRUNCATED, trainable), instead of cutting the next turn mid-generation.
+        max_traj = config.get("max_trajectory_tokens")
+        if max_traj:
+            remaining = int(max_traj) - len(input_ids)
+            if remaining <= 0:
+                raise ContextWindowOverflowException(
+                    f"trajectory token budget {max_traj} reached (prompt={len(input_ids)})"
+                )
+            _cur = sampling_params.get("max_new_tokens")
+            sampling_params["max_new_tokens"] = remaining if _cur is None else min(int(_cur), remaining)
 
         # Assistant message start
         yield {"messageStart": {"role": "assistant"}}
