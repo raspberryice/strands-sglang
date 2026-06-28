@@ -218,3 +218,53 @@ class TestTokenManagerReset:
 
         assert manager.token_ids == [10, 20, 30]
         assert len(manager) == 3
+
+
+class TestTokenManagerSeedPrefix:
+    """seed_prefix() reconstructs alternating PROMPT/RESPONSE segments from a stored stream."""
+
+    def test_seed_prefix_basic(self):
+        """A 0/1 loss-mask splits into one PROMPT then one RESPONSE segment."""
+        manager = TokenManager()
+        manager.seed_prefix([1, 2, 3, 4, 5], [0, 0, 0, 1, 1])
+        assert manager.token_ids == [1, 2, 3, 4, 5]
+        assert manager.loss_mask == [0, 0, 0, 1, 1]
+        assert manager.segment_info == [(False, 3), (True, 2)]
+
+    def test_seed_prefix_logprobs(self):
+        """Logprobs ride along, attached per token (None allowed)."""
+        manager = TokenManager()
+        manager.seed_prefix([1, 2, 3], [0, 1, 1], [None, -0.5, -0.2])
+        assert manager.logprobs == [None, -0.5, -0.2]
+        assert manager.loss_mask == [0, 1, 1]
+
+    def test_seed_prefix_multi_turn_alternation(self):
+        """Multiple turns -> a fresh segment at every loss-mask run boundary."""
+        manager = TokenManager()
+        manager.seed_prefix([1, 2, 3, 4, 5, 6], [0, 0, 1, 1, 0, 1])
+        assert manager.segment_info == [(False, 2), (True, 2), (False, 1), (True, 1)]
+        assert manager.token_ids == [1, 2, 3, 4, 5, 6]
+
+    def test_seed_prefix_then_continue(self):
+        """After seeding, add_* appends the continuation as the next segment(s)."""
+        manager = TokenManager()
+        manager.seed_prefix([1, 2, 3], [0, 0, 1])
+        manager.add_prompt([4, 5])  # e.g. the continue-prompt turn
+        manager.add_response([6, 7], [-0.1, -0.2])
+        assert manager.token_ids == [1, 2, 3, 4, 5, 6, 7]
+        assert manager.loss_mask == [0, 0, 1, 0, 0, 1, 1]
+        assert manager.logprobs == [None, None, None, None, None, -0.1, -0.2]
+
+    def test_seed_prefix_requires_fresh_manager(self):
+        """seed_prefix() on a non-fresh manager raises (seed-once)."""
+        manager = TokenManager()
+        manager.add_prompt([1, 2])
+        with pytest.raises(RuntimeError, match="fresh TokenManager"):
+            manager.seed_prefix([3, 4], [0, 1])
+
+    def test_seed_prefix_length_mismatch(self):
+        """Mismatched loss_mask / logprobs lengths raise ValueError."""
+        with pytest.raises(ValueError, match="loss_mask length"):
+            TokenManager().seed_prefix([1, 2, 3], [0, 1])
+        with pytest.raises(ValueError, match="logprobs length"):
+            TokenManager().seed_prefix([1, 2], [0, 1], [-0.1])

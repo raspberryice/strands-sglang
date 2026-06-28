@@ -20,7 +20,7 @@ import numpy as np
 import pybase64
 import pytest
 
-from strands_sglang import GenerationAbortedException, SGLangModel
+from strands_sglang import GenerationAbortedException, PrefixSeed, SGLangModel
 from strands_sglang.client import SGLangClient
 
 
@@ -57,6 +57,35 @@ class TestPreserveThinking:
         client = SGLangClient(base_url="http://localhost:30000")
         model = SGLangModel(client=client, tokenizer=mock_tokenizer, preserve_thinking=True)
         assert model._chat_template_kwargs["preserve_thinking"] is True
+
+
+class TestPrefixSeed:
+    """prefix_seed seeds the token_manager + message_count for resume-in-place (no re-render)."""
+
+    def test_seeds_token_manager_and_message_count(self, mock_tokenizer):
+        client = SGLangClient(base_url="http://localhost:30000")
+        seed = PrefixSeed(
+            token_ids=[1, 2, 3, 4], loss_mask=[0, 0, 1, 1], logprobs=[None, None, -0.1, -0.2], message_count=2
+        )
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer, prefix_seed=seed)
+        assert model.token_manager.token_ids == [1, 2, 3, 4]
+        assert model.token_manager.loss_mask == [0, 0, 1, 1]
+        assert model.token_manager.logprobs == [None, None, -0.1, -0.2]
+        assert model.message_count == 2
+
+    def test_seed_survives_reset(self, mock_tokenizer):
+        client = SGLangClient(base_url="http://localhost:30000")
+        seed = PrefixSeed(token_ids=[1, 2, 3], loss_mask=[0, 1, 1], logprobs=None, message_count=1)
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer, prefix_seed=seed)
+        model.reset()
+        assert model.token_manager.token_ids == [1, 2, 3]
+        assert model.message_count == 1
+
+    def test_no_seed_leaves_model_empty(self, mock_tokenizer):
+        client = SGLangClient(base_url="http://localhost:30000")
+        model = SGLangModel(client=client, tokenizer=mock_tokenizer)
+        assert model.token_manager.token_ids == []
+        assert model.message_count == 0
 
 
 class TestFormatTools:

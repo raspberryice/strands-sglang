@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import AsyncGenerator, AsyncIterable
+from dataclasses import dataclass
 from functools import cached_property
 from typing import (
     Any,
@@ -48,6 +49,22 @@ from .tool_parsers import HermesToolParser, ToolParser
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+
+
+@dataclass(frozen=True, slots=True)
+class PrefixSeed:
+    """A stored token stream to resume a trajectory from in-place (no re-render).
+
+    `token_ids`/`loss_mask`/`logprobs` are the exact accumulated stream up to the resume point
+    (loss_mask 1 = model output). `message_count` is the number of conversation messages that stream
+    represents, so the first `stream()` call tokenizes only the new (continue) turn instead of
+    re-rendering the whole history. See `SGLangModel(prefix_seed=...)` and `TokenManager.seed_prefix`.
+    """
+
+    token_ids: list[int]
+    loss_mask: list[int]
+    logprobs: list[float | None] | None
+    message_count: int
 
 
 class SGLangModel(Model):
@@ -81,6 +98,7 @@ class SGLangModel(Model):
         client: SGLangClient,
         tokenizer: PreTrainedTokenizerBase,
         tool_parser: ToolParser | None = None,
+        prefix_seed: PrefixSeed | None = None,
         **config: Unpack[SGLangConfig],
     ) -> None:
         """Initialize SGLang model provider.
@@ -89,6 +107,8 @@ class SGLangModel(Model):
             client: `SGLangClient` for HTTP communication with the SGLang server.
             tokenizer: HuggingFace tokenizer for chat template and tokenization.
             tool_parser: `ToolParser` for tool calls (default: `HermesToolParser`).
+            prefix_seed: optional stored token stream to resume from in-place (no re-render) —
+                seeds the `token_manager` + `message_count`. See `PrefixSeed`.
             **config: Additional SGLang generation configuration (see `SGLangConfig`).
         """
         self.client = client
@@ -119,6 +139,10 @@ class SGLangModel(Model):
         self.message_count: int = 0
         self.tool_parse_errors: dict[str, int] = {}  # per-tool parse error count
         self.image_data: list[str] = []  # accumulated image data URLs (VLM only)
+        # Optional resume-in-place seed (aborted-trajectory replay): seeds token_manager +
+        # message_count so the first stream() call continues incrementally instead of re-rendering.
+        self._prefix_seed = prefix_seed
+        self._apply_prefix_seed()
 
         logger.debug("initialized with config: %s", self.config)
 
@@ -141,6 +165,20 @@ class SGLangModel(Model):
         self.routed_experts_per_call = []
         self.weight_versions = []
         self.finish_reasons = []
+        self._apply_prefix_seed()
+
+    def _apply_prefix_seed(self) -> None:
+        """Seed the token stream + `message_count` from `self._prefix_seed` (resume-in-place).
+
+        Called from `__init__` and `reset()` so the seed survives a per-episode reset. With a seed
+        set, the first `stream()` call takes the incremental branch (tokenizes only the continue
+        turn) instead of re-rendering the prefix. No-op when no seed was provided.
+        """
+        if self._prefix_seed is None:
+            return
+        seed = self._prefix_seed
+        self.token_manager.seed_prefix(seed.token_ids, seed.loss_mask, seed.logprobs)
+        self.message_count = seed.message_count
 
     # -------------------------------------------------------------------------
     # Model interface implementation
@@ -483,8 +521,7 @@ class SGLangModel(Model):
             # `finish_reasons` are already updated above, so partial-state
             # diagnostics survive.
             raise GenerationAbortedException(
-                f"SGLang aborted generation mid-stream (finish_reason=abort; "
-                f"{len(output_ids)} partial output tokens)"
+                f"SGLang aborted generation mid-stream (finish_reason=abort; {len(output_ids)} partial output tokens)"
             )
         yield {"messageStop": {"stopReason": cast(StopReason, stop_reason)}}
 

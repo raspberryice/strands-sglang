@@ -24,7 +24,7 @@ from .exceptions import (
     SGLangHTTPError,
     SGLangThrottledError,
 )
-from .sglang import SGLangModel
+from .sglang import PrefixSeed, SGLangModel
 from .token import Token, TokenManager
 from .tool_limiter import MaxToolCallsReachedError, MaxToolIterationsReachedError, ToolLimiter
 from .tool_parsers import get_tool_parser
@@ -47,6 +47,7 @@ __all__ = [
     "SGLangDecodingError",
     "GenerationAbortedException",
     # Model
+    "PrefixSeed",
     "SGLangModel",
     # Token management
     "Token",

@@ -96,6 +96,55 @@ class TokenManager:
         ]
         self._segments.append(tokens)
 
+    def seed_prefix(
+        self,
+        token_ids: list[int],
+        loss_mask: list[int],
+        logprobs: list[float | None] | None = None,
+    ) -> None:
+        """Seed with a pre-existing token stream as alternating `PROMPT`/`RESPONSE` segments.
+
+        Splits `token_ids` into segments at `loss_mask` run boundaries (0 -> `PROMPT`,
+        1 -> `RESPONSE`), reproducing the segment structure an in-order `add_prompt`/`add_response`
+        sequence would build. Use to resume a trajectory from its exact token-in/token-out stream
+        without re-rendering the conversation (e.g. an aborted-trajectory replay). Must be called
+        on a fresh manager (before any `add_*`, or right after `reset()`).
+
+        Args:
+            token_ids: the accumulated token ids of the prefix.
+            loss_mask: per-token mask (1 = model output / `RESPONSE`, 0 = prompt/tool / `PROMPT`).
+            logprobs: per-token log-probs (the behavior policy's); a `None` entry is allowed.
+
+        Raises:
+            RuntimeError: if the manager is not fresh.
+            ValueError: on a length mismatch.
+        """
+        if self._segments:
+            raise RuntimeError("seed_prefix() requires a fresh TokenManager (call before any add_*/after reset()).")
+        if len(loss_mask) != len(token_ids):
+            raise ValueError(f"loss_mask length ({len(loss_mask)}) must match token_ids length ({len(token_ids)})")
+        if logprobs is not None and len(logprobs) != len(token_ids):
+            raise ValueError(f"logprobs length ({len(logprobs)}) must match token_ids length ({len(token_ids)})")
+
+        n = len(token_ids)
+        i = 0
+        while i < n:
+            is_output = bool(loss_mask[i])
+            j = i
+            while j < n and bool(loss_mask[j]) == is_output:
+                j += 1
+            self._segments.append(
+                [
+                    Token(
+                        token_id=token_ids[k],
+                        logprob=(logprobs[k] if logprobs is not None else None),
+                        loss_mask=is_output,
+                    )
+                    for k in range(i, j)
+                ]
+            )
+            i = j
+
     @property
     def tokens(self) -> list[Token]:
         """Get all tokens as a flat list."""
