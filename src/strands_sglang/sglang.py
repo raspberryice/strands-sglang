@@ -128,6 +128,13 @@ class SGLangModel(Model):
         self.token_manager = TokenManager()
         # One base64 MoE expert-index payload per `stream()` call. Ordered by call.
         self.routed_experts_per_call: list[str] = []
+        # Top-p mask replay: one (ids, offsets) base64 pair per `stream()` call,
+        # ordered. Each covers only THIS call's output tokens (the sampler emits
+        # the kept nucleus per generated token), so the bridge concatenates the
+        # per-call payloads directly — no start-len slicing. `.get()`-tolerant of
+        # calls where the server omits the key (top_p==1.0 / feature off).
+        self.top_p_token_ids_per_call: list[str | None] = []
+        self.top_p_token_offsets_per_call: list[str | None] = []
         # One `meta_info["weight_version"]` per `stream()` call (may span multiple
         # checkpoint versions for multi-turn episodes under mid-episode weight sync).
         self.weight_versions: list[str] = []
@@ -163,6 +170,8 @@ class SGLangModel(Model):
         self.tool_parse_errors = {}
         self.image_data = []
         self.routed_experts_per_call = []
+        self.top_p_token_ids_per_call = []
+        self.top_p_token_offsets_per_call = []
         self.weight_versions = []
         self.finish_reasons = []
         self._apply_prefix_seed()
@@ -477,6 +486,16 @@ class SGLangModel(Model):
         # None payloads and falls through to skip-on-mismatch when enabled.
         if return_routed_experts:
             self.routed_experts_per_call.append(meta_info.get("routed_experts"))
+        # Top-p mask replay: append this call's kept-nucleus payload (base64 int32
+        # ids + ragged offsets), one entry per call. Recorded whenever the server
+        # returned it (the request opts in via custom_params in sampling_params);
+        # `.get()` yields None on calls where top-p was inactive, which the bridge
+        # tolerates. Each payload covers only this call's output tokens, so the
+        # bridge concatenates per-call payloads with cumulative offset shifting.
+        top_p_ids = meta_info.get("top_p_token_ids")
+        if top_p_ids is not None or self.top_p_token_ids_per_call:
+            self.top_p_token_ids_per_call.append(top_p_ids)
+            self.top_p_token_offsets_per_call.append(meta_info.get("top_p_token_offsets"))
         # Append the server's reported weight version for staleness tracking.
         weight_version = meta_info.get("weight_version")
         if weight_version is not None:
