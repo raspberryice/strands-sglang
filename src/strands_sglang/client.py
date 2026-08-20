@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from contextvars import ContextVar
 from typing import Any
 
@@ -45,6 +46,21 @@ request_headers: ContextVar[dict[str, str] | None] = ContextVar("sglang_request_
 # attempt and bails with `SGLangConnectionError` rather than burning the rest of
 # the trajectory budget on retries. None = no deadline (legacy behavior).
 request_deadline: ContextVar[float | None] = ContextVar("sglang_request_deadline", default=None)
+
+# Per-task mutable dict the caller (Slime's agent bridge) creates once per trajectory
+# and passes down via `abort_state.set({})`. The `/generate` deadline watchdog sets
+# `abort_state["deadline_aborted"] = True` IN PLACE when it explicitly aborts the
+# in-flight request at the trajectory deadline. Because the bridge holds a reference
+# to the SAME dict object, the in-place mutation is visible across the `asyncio.wait_for`
+# child-task boundary (a fresh `.set()` would not be) — this is how the bridge tells a
+# deadline abort (recover + train the partial) apart from a weight-sync abort
+# (neutralize + retry). None = no deadline capture. See design/timeout_abort_partial_capture.md.
+abort_state: ContextVar[dict | None] = ContextVar("sglang_abort_state", default=None)
+
+# Stickiness header key (mirrors the bridge's _TRAJECTORY_ID_HEADER). Routes a request
+# — and its /abort_request — to the same engine via the slime router. Kept in sync by
+# value; the bridge is the source of truth.
+_TRAJECTORY_ID_HEADER = "X-Slime-Trajectory-Id"
 
 logger = logging.getLogger(__name__)
 
@@ -205,95 +221,157 @@ class SGLangClient:
         # Retry all connection/timeout/decoding errors
         return True
 
+    async def _abort_at_deadline(
+        self,
+        rid: str,
+        deadline: float,
+        extra_headers: dict[str, str] | None,
+        abort_state_dict: dict | None,
+    ) -> None:
+        """Watchdog task: at `deadline`, explicitly abort the in-flight `/generate`
+        request `rid` via `POST /abort_request` on a SEPARATE connection, leaving the
+        original `/generate` socket OPEN.
+
+        The server marks the running request `FINISH_ABORT(status_code=None)` and
+        returns its partial `output_ids`/`output_token_logprobs`/`routed_experts`/
+        `top_p_token_ids` as an HTTP-200 body on the still-open connection, so
+        `generate()` returns the partial (no exception → no retry) instead of the
+        caller hard-cancelling (which disconnects and discards the partial). Sets
+        `abort_state_dict["deadline_aborted"] = True` so the bridge recovers + trains
+        the partial (a weight-sync `abort_all` never trips this). Best-effort — never
+        raises into the caller. `extra_headers` carries the stickiness header so the
+        abort routes to the same engine holding `rid`.
+        """
+        try:
+            delay = deadline - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            session = self._get_session()
+            async with session.post("/abort_request", json={"rid": rid}, headers=extra_headers) as resp:
+                await resp.read()
+            if abort_state_dict is not None:
+                abort_state_dict["deadline_aborted"] = True
+            logger.info("Issued /abort_request for rid=%s at trajectory deadline", rid)
+        except asyncio.CancelledError:
+            # Normal path when generate() finished and cancels the watchdog.
+            raise
+        except Exception as e:  # noqa: BLE001 — deadline abort is best-effort
+            logger.warning("deadline /abort_request for rid=%s failed (best-effort): %s", rid, e)
+
     async def generate(self, input_ids: list[int], **kwargs: Any) -> dict[str, Any]:
         """Call SGLang `/generate` endpoint with retry.
 
         Notes:
             Non-retryable: 401/403/404 and context-length 400s. All other errors are retried.
+            When `request_deadline` is set, a watchdog explicitly aborts this request at
+            the deadline (`_abort_at_deadline`) so the server returns its partial output
+            instead of the caller cancelling and losing it.
         """
-        payload: dict[str, Any] = {
-            "input_ids": input_ids,
-            **kwargs,
-            "stream": False,  # override kwargs to non-streaming for RL training
-        }
-
         last_error: Exception | None = None
         session = self._get_session()
         extra_headers = request_headers.get()
         deadline = request_deadline.get()
 
-        for attempt in range(self.max_retries + 1):
-            try:
-                async with session.post("/generate", json=payload, headers=extra_headers) as resp:
-                    if resp.status >= 400:
-                        body = await resp.text()
-                        raise self._classify_http_error(resp.status, body)
+        # Unique per-call request id so the deadline watchdog can abort THIS request
+        # (and only this one). The scheduler aborts by `rid.startswith(...)`, so the
+        # uuid suffix prevents a prefix-abort from hitting sibling calls; the prefix
+        # is for log correlation with the trajectory only.
+        _prefix = (extra_headers or {}).get(_TRAJECTORY_ID_HEADER) or "slime"
+        rid = f"{_prefix}-{uuid.uuid4().hex}"
+        payload: dict[str, Any] = {
+            "input_ids": input_ids,
+            **kwargs,
+            "stream": False,  # override kwargs to non-streaming for RL training
+            "rid": rid,
+        }
 
-                    # Success path: parse JSON directly
-                    try:
-                        return await resp.json(content_type=None)
-                    except Exception as e:
-                        # Non-JSON response — treat as retryable error
-                        raise SGLangDecodingError(f"Invalid JSON response: {e}") from e
+        # Deadline watchdog: at the trajectory deadline, explicitly abort this request
+        # server-side (keeping the /generate socket open) so the server returns its
+        # partial output instead of the caller cancelling and discarding it. Off when
+        # no deadline is set (legacy). Cancelled in `finally`.
+        _abort_state = abort_state.get()
+        watchdog: asyncio.Task[None] | None = None
+        if deadline is not None:
+            watchdog = asyncio.create_task(
+                self._abort_at_deadline(rid, deadline, extra_headers, _abort_state)
+            )
 
-            except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
-                # `ClientConnectionError` is the aiohttp parent of
-                # `ClientConnectorError`, `ClientOSError`, `ServerDisconnectedError`,
-                # and `ServerTimeoutError` — all connection-level failures that
-                # are retryable and worth a typed wrapper. `ClientPayloadError`
-                # (transient mid-response truncation) is a sibling under
-                # `ClientError`; folding it in here keeps these from falling
-                # through to the catch-all below where they'd surface as
-                # opaque `SGLangClientError("Server disconnected")` and get
-                # classified as `unclassified_error` downstream.
-                last_error = SGLangConnectionError(str(e) or type(e).__name__)
-                last_error.__cause__ = e
+        try:
+            for attempt in range(self.max_retries + 1):
+                try:
+                    async with session.post("/generate", json=payload, headers=extra_headers) as resp:
+                        if resp.status >= 400:
+                            body = await resp.text()
+                            raise self._classify_http_error(resp.status, body)
 
-            except SGLangClientError as e:
-                last_error = e
+                        # Success path: parse JSON directly
+                        try:
+                            return await resp.json(content_type=None)
+                        except Exception as e:
+                            # Non-JSON response — treat as retryable error
+                            raise SGLangDecodingError(f"Invalid JSON response: {e}") from e
 
-                # Check if error is retryable
-                if not self._is_retryable_error(e):
-                    raise
+                except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
+                    # `ClientConnectionError` is the aiohttp parent of
+                    # `ClientConnectorError`, `ClientOSError`, `ServerDisconnectedError`,
+                    # and `ServerTimeoutError` — all connection-level failures that
+                    # are retryable and worth a typed wrapper. `ClientPayloadError`
+                    # (transient mid-response truncation) is a sibling under
+                    # `ClientError`; folding it in here keeps these from falling
+                    # through to the catch-all below where they'd surface as
+                    # opaque `SGLangClientError("Server disconnected")` and get
+                    # classified as `unclassified_error` downstream.
+                    last_error = SGLangConnectionError(str(e) or type(e).__name__)
+                    last_error.__cause__ = e
 
-            except Exception as e:
-                # Unexpected errors — wrap to prevent library internals leaking
-                last_error = SGLangClientError(str(e))
-                last_error.__cause__ = e
+                except SGLangClientError as e:
+                    last_error = e
 
-            # Decide: retry, or bail (budget exhausted or deadline elapsed)
-            error_detail = str(last_error)
-            deadline_exceeded = deadline is not None and time.monotonic() >= deadline
-            if attempt < self.max_retries and not deadline_exceeded:
-                logger.warning(
-                    "SGLang request failed (attempt %d/%d): %s: %s. Retrying in %ss...",
-                    attempt + 1,
-                    self.max_retries + 1,
-                    type(last_error).__name__,
-                    error_detail,
-                    self.retry_delay,
-                )
-                await asyncio.sleep(self.retry_delay)
-            else:
-                if deadline_exceeded:
-                    logger.error(
-                        "SGLang request failed (attempt %d/%d): %s: %s. "
-                        "Trajectory deadline exceeded; not retrying.",
+                    # Check if error is retryable
+                    if not self._is_retryable_error(e):
+                        raise
+
+                except Exception as e:
+                    # Unexpected errors — wrap to prevent library internals leaking
+                    last_error = SGLangClientError(str(e))
+                    last_error.__cause__ = e
+
+                # Decide: retry, or bail (budget exhausted or deadline elapsed)
+                error_detail = str(last_error)
+                deadline_exceeded = deadline is not None and time.monotonic() >= deadline
+                if attempt < self.max_retries and not deadline_exceeded:
+                    logger.warning(
+                        "SGLang request failed (attempt %d/%d): %s: %s. Retrying in %ss...",
                         attempt + 1,
                         self.max_retries + 1,
                         type(last_error).__name__,
                         error_detail,
+                        self.retry_delay,
                     )
+                    await asyncio.sleep(self.retry_delay)
                 else:
-                    logger.error(
-                        "SGLang request failed after %d attempts: %s: %s",
-                        self.max_retries + 1,
-                        type(last_error).__name__,
-                        error_detail,
-                    )
-                raise last_error
+                    if deadline_exceeded:
+                        logger.error(
+                            "SGLang request failed (attempt %d/%d): %s: %s. "
+                            "Trajectory deadline exceeded; not retrying.",
+                            attempt + 1,
+                            self.max_retries + 1,
+                            type(last_error).__name__,
+                            error_detail,
+                        )
+                    else:
+                        logger.error(
+                            "SGLang request failed after %d attempts: %s: %s",
+                            self.max_retries + 1,
+                            type(last_error).__name__,
+                            error_detail,
+                        )
+                    raise last_error
 
-        raise RuntimeError("Unreachable: loop must return or raise")
+            raise RuntimeError("Unreachable: loop must return or raise")
+        finally:
+            if watchdog is not None and not watchdog.done():
+                watchdog.cancel()
 
     async def health(self) -> bool:
         """Check if SGLang server is healthy."""
