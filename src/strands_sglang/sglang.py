@@ -91,6 +91,7 @@ class SGLangModel(Model):
         enable_thinking: bool | None  # Enable thinking mode for Qwen3 hybrid models
         preserve_thinking: bool | None  # Keep <think> in history turns on re-render (resume alignment)
         max_trajectory_tokens: int | None  # Cap cumulative trajectory tokens (prompt+gen); None = off
+        max_segment_tokens: int | None  # Cap per-segment tokens (compaction trigger); None = off
 
     def __init__(
         self,
@@ -415,21 +416,37 @@ class SGLangModel(Model):
         # Tracking token IDs in token_manager to ensure the token-in feature
         input_ids = self.token_manager.token_ids + new_input_ids
 
-        # Slime-side trajectory token budget: clamp this turn's max_new_tokens so the cumulative
-        # trajectory (prompt + all generation) never exceeds max_trajectory_tokens. The context cap
-        # is only applied to the initial prompt, so multi-turn trajectories -- especially resumes
-        # seeded with a long prefix -- otherwise grow unbounded toward the model's native context.
-        # None -> off (legacy). When the budget is reached, truncate the same way a real context
-        # overflow does (TRUNCATED, trainable), instead of cutting the next turn mid-generation.
+        # Slime-side token budgets: clamp this turn's max_new_tokens to the tightest remaining budget
+        # so the trajectory can't grow unbounded toward the model's native context (the context cap is
+        # only applied to the INITIAL prompt, so multi-turn trajectories -- esp. long-prefix resumes --
+        # otherwise grow without bound). Two budgets (both None -> off, legacy):
+        #   * max_trajectory_tokens: cumulative prompt + all generation across ALL segments (outer wall).
+        #   * max_segment_tokens:    the ACTIVE segment only (compaction trigger). In Phase 0/1 a
+        #       trajectory is one segment (active_base == 0), so this coincides with the trajectory
+        #       budget; Phase 3 sets `_segment_active_base` on an in-loop reseed so the segment budget
+        #       resets per segment while the trajectory budget keeps summing. See
+        #       design/segment_tree_trajectories.md.
+        # Reaching EITHER ends the turn/trajectory as TRUNCATED (trainable) -- the same path a real
+        # context overflow takes -- instead of cutting the next turn mid-generation. Phase 3 will
+        # intercept the segment threshold in the AfterModelCallEvent hook (inject summary + reseed_inplace)
+        # BEFORE this clamp would raise; the clamp remains the terminal backstop.
+        _budgets: list[tuple[str, int, int]] = []  # (name, cap, remaining)
         max_traj = config.get("max_trajectory_tokens")
         if max_traj:
-            remaining = int(max_traj) - len(input_ids)
-            if remaining <= 0:
+            _budgets.append(("trajectory", int(max_traj), int(max_traj) - len(input_ids)))
+        max_seg = config.get("max_segment_tokens")
+        if max_seg:
+            _active_seg_tokens = len(input_ids) - getattr(self, "_segment_active_base", 0)
+            _budgets.append(("segment", int(max_seg), int(max_seg) - _active_seg_tokens))
+        for _name, _cap, _rem in _budgets:
+            if _rem <= 0:
                 raise ContextWindowOverflowException(
-                    f"trajectory token budget {max_traj} reached (prompt={len(input_ids)})"
+                    f"{_name} token budget {_cap} reached (prompt={len(input_ids)})"
                 )
+        if _budgets:
+            _rem_min = min(_rem for _, _, _rem in _budgets)
             _cur = sampling_params.get("max_new_tokens")
-            sampling_params["max_new_tokens"] = remaining if _cur is None else min(int(_cur), remaining)
+            sampling_params["max_new_tokens"] = _rem_min if _cur is None else min(int(_cur), _rem_min)
 
         # Assistant message start
         yield {"messageStart": {"role": "assistant"}}
