@@ -152,6 +152,13 @@ class SGLangModel(Model):
         # reseed there is one segment ([0]) and every path below is byte-identical.
         self._stream_call_count: int = 0
         self._traj_seg_call_starts: list[int] = [0]
+        # Compaction reseed support: the render context of the last stream() call (reused to
+        # tokenize the compacted [problem+summary] seed identically), and a one-shot flag telling
+        # the next tokenize_prompt_messages to emit no new tokens (generate straight from the
+        # freshly-seeded active window). Both inert unless compact_reseed() is called.
+        self._last_tool_specs: list[ToolSpec] | None = None
+        self._last_system_prompt: str | None = None
+        self._generate_from_window_next: bool = False
         self.tool_parse_errors: dict[str, int] = {}  # per-tool parse error count
         self.image_data: list[str] = []  # accumulated image data URLs (VLM only)
         # Optional resume-in-place seed (aborted-trajectory replay): seeds token_manager +
@@ -177,6 +184,9 @@ class SGLangModel(Model):
         self.message_count = 0
         self._stream_call_count = 0
         self._traj_seg_call_starts = [0]
+        self._last_tool_specs = None
+        self._last_system_prompt = None
+        self._generate_from_window_next = False
         self.tool_parse_errors = {}
         self.image_data = []
         self.routed_experts_per_call = []
@@ -236,6 +246,42 @@ class SGLangModel(Model):
         """Per-call indices where each trajectory-segment's generation begins (for the bridge's
         per-segment routing/top-p partition). Always starts [0]; one extra entry per reseed."""
         return list(self._traj_seg_call_starts)
+
+    def compact_reseed(self, compacted_messages: Messages, *, is_multimodal: bool = False) -> None:
+        """Compaction reseed from a compacted message list (design/segment_tree_trajectories.md).
+
+        Tokenizes `compacted_messages` (e.g. [problem, assistant(summary)]) via the SAME full-render
+        path a fresh episode's first turn uses (system prompt + tools + add_generation_prompt),
+        reusing the render context of the last stream() call so the seed is byte-consistent with
+        what the model then generates from. The seed is installed as the new active window with
+        `loss_mask=0` (masked context — the new segment trains only its OWN generated tokens), and
+        a one-shot flag makes the next stream() emit no new prompt tokens (generate straight from
+        the seeded window). The caller (the compaction hook) must set `agent.messages` to exactly
+        `compacted_messages` so subsequent incremental tokenization stays aligned (message_count is
+        set to len(compacted_messages) here).
+
+        LIVE-VALIDATE: the seed must reproduce the exact tokens the server prefILLs; verify in a
+        1-node isolation run that the new segment's per-token logprobs/routing align.
+        """
+        saved_count = self.message_count
+        self.message_count = 0  # force the full-render (first-call) tokenization path
+        try:
+            seed_token_ids = self.tokenize_prompt_messages(
+                messages=compacted_messages,
+                system_prompt=self._last_system_prompt,
+                tool_specs=self._last_tool_specs,
+                is_multimodal=is_multimodal,
+            )
+        finally:
+            self.message_count = saved_count
+        # Masked seed: the new segment conditions on it but never trains it (it's prompt context).
+        self.reseed_inplace(
+            seed_token_ids,
+            [0] * len(seed_token_ids),
+            None,
+            new_message_count=len(compacted_messages),
+        )
+        self._generate_from_window_next = True
 
     # -------------------------------------------------------------------------
     # Model interface implementation
@@ -379,6 +425,13 @@ class SGLangModel(Model):
             then subtracts it to extract only incremental tokens.
         """
 
+        # Compaction: right after a reseed the active window already ends with an assistant
+        # generation prompt, so there is nothing new to tokenize — emit [] and let stream()
+        # generate straight from the seeded window. One-shot (cleared here). See compact_reseed.
+        if self._generate_from_window_next:
+            self._generate_from_window_next = False
+            return []
+
         # TODO: add support for other modalities (e.g. audio, video, etc.)
         def update_multimodal_data(hf_messages: list[dict[str, Any]]) -> None:
             if not is_multimodal:
@@ -454,6 +507,10 @@ class SGLangModel(Model):
         return_logprob = config.get("return_logprob", True)
         return_routed_experts = config.get("return_routed_experts", False)
         is_multimodal = await self.client.is_multimodal()
+        # Stash the render context so a mid-loop compaction reseed can re-tokenize the compacted
+        # [problem+summary] seed with byte-identical system-prompt/tool framing (compact_reseed).
+        self._last_tool_specs = tool_specs
+        self._last_system_prompt = system_prompt
         new_input_ids = self.tokenize_prompt_messages(
             messages=messages,
             system_prompt=system_prompt,
