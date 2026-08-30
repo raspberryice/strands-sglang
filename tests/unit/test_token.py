@@ -268,3 +268,79 @@ class TestTokenManagerSeedPrefix:
             TokenManager().seed_prefix([1, 2, 3], [0, 1])
         with pytest.raises(ValueError, match="logprobs length"):
             TokenManager().seed_prefix([1, 2], [0, 1], [-0.1])
+
+
+class TestTokenManagerReseedInplace:
+    """reseed_inplace() closes the active trajectory-segment and starts a fresh one (Phase-3
+    in-loop compaction, design/segment_tree_trajectories.md)."""
+
+    def test_default_single_trajectory_segment(self):
+        """No reseed -> one trajectory-segment spanning the whole stream (unchanged behavior)."""
+        m = TokenManager()
+        m.add_prompt([1, 2, 3])
+        m.add_response([4, 5], [-0.1, -0.2])
+        assert m.n_trajectory_segments == 1
+        assert m.active_base_offset == 0
+        assert m.trajectory_segment_bounds == [(0, 5)]
+
+    def test_reseed_records_boundary_and_active_base(self):
+        """Reseed archives turns in place, moves active_base to the seed, adds a boundary."""
+        m = TokenManager()
+        m.add_prompt([1, 2, 3])            # seg0 turns
+        m.add_response([4, 5], [-0.1, -0.2])
+        m.reseed_inplace([9, 8, 7], [0, 0, 1], [None, None, -0.3])  # [problem+summary] seed; last=trained
+        # Archived turns remain; the flat stream keeps growing.
+        assert m.token_ids == [1, 2, 3, 4, 5, 9, 8, 7]
+        assert m.loss_mask == [0, 0, 0, 1, 1, 0, 0, 1]
+        assert m.n_trajectory_segments == 2
+        assert m.active_base_offset == 5                      # seed starts at token 5
+        assert m.trajectory_segment_bounds == [(0, 5), (5, 8)]
+
+    def test_reseed_then_continue_extends_active_segment(self):
+        """Post-reseed add_* extends the ACTIVE trajectory-segment (base unchanged)."""
+        m = TokenManager()
+        m.add_prompt([1, 2])
+        m.add_response([3], [-0.1])
+        m.reseed_inplace([9, 8], [0, 1], [None, -0.2])   # summary masked (0), then a trained token
+        m.add_prompt([7])                                 # e.g. a tool result in the new segment
+        m.add_response([6, 5], [-0.3, -0.4])
+        assert m.token_ids == [1, 2, 3, 9, 8, 7, 6, 5]
+        assert m.active_base_offset == 3
+        assert m.trajectory_segment_bounds == [(0, 3), (3, 8)]
+        # The active window the model would send to /generate is exactly the 2nd segment.
+        base = m.active_base_offset
+        assert m.token_ids[base:] == [9, 8, 7, 6, 5]
+
+    def test_multiple_reseeds_tile_the_stream(self):
+        """Each reseed adds a boundary; bounds tile token_ids exactly."""
+        m = TokenManager()
+        m.add_prompt([1]); m.add_response([2], [-0.1])
+        m.reseed_inplace([3, 4], [0, 1])
+        m.add_response([5], [-0.2])
+        m.reseed_inplace([6], [0])
+        m.add_response([7], [-0.3])
+        assert m.n_trajectory_segments == 3
+        assert m.trajectory_segment_bounds == [(0, 2), (2, 5), (5, 7)]
+        # Concatenated per-segment slices == the full stream.
+        flat = [t for a, b in m.trajectory_segment_bounds for t in m.token_ids[a:b]]
+        assert flat == m.token_ids == [1, 2, 3, 4, 5, 6, 7]
+
+    def test_reseed_requires_existing_trajectory(self):
+        with pytest.raises(RuntimeError, match="requires an existing trajectory"):
+            TokenManager().reseed_inplace([1, 2], [0, 1])
+
+    def test_reseed_length_mismatch(self):
+        m = TokenManager(); m.add_prompt([1, 2])
+        with pytest.raises(ValueError, match="loss_mask length"):
+            m.reseed_inplace([1, 2, 3], [0, 1])
+        with pytest.raises(ValueError, match="logprobs length"):
+            m.reseed_inplace([1, 2], [0, 1], [-0.1])
+
+    def test_reset_clears_trajectory_segments(self):
+        m = TokenManager()
+        m.add_prompt([1]); m.add_response([2], [-0.1]); m.reseed_inplace([3], [0])
+        assert m.n_trajectory_segments == 2
+        m.reset()
+        assert m.n_trajectory_segments == 1
+        assert m.active_base_offset == 0
+        assert m.trajectory_segment_bounds == [(0, 0)]
