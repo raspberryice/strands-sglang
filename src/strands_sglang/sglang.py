@@ -159,6 +159,13 @@ class SGLangModel(Model):
         self._last_tool_specs: list[ToolSpec] | None = None
         self._last_system_prompt: str | None = None
         self._generate_from_window_next: bool = False
+        # One-shot: the next stream() call after a reseed sends logprob/routing start_len=0
+        # so the engine returns routing over the ENTIRE active window — including the masked
+        # seed prefix, which was appended out-of-band (not as a call's new_input_ids) and so
+        # would otherwise be skipped by the incremental start_len. This makes a reseeded
+        # segment's per-call routing concatenate to seg_len-1 (like a fresh segment's first
+        # call), so the bridge can reconstruct + TRAIN it. Inert unless reseed_inplace() runs.
+        self._capture_seed_routing_next: bool = False
         self.tool_parse_errors: dict[str, int] = {}  # per-tool parse error count
         self.image_data: list[str] = []  # accumulated image data URLs (VLM only)
         # Optional resume-in-place seed (aborted-trajectory replay): seeds token_manager +
@@ -187,6 +194,7 @@ class SGLangModel(Model):
         self._last_tool_specs = None
         self._last_system_prompt = None
         self._generate_from_window_next = False
+        self._capture_seed_routing_next = False
         self.tool_parse_errors = {}
         self.image_data = []
         self.routed_experts_per_call = []
@@ -240,6 +248,11 @@ class SGLangModel(Model):
         self.token_manager.reseed_inplace(seed_token_ids, seed_loss_mask, seed_logprobs)
         self._traj_seg_call_starts.append(self._stream_call_count)
         self.message_count = int(new_message_count)
+        # The seed was appended out-of-band (no /generate call), so the next call must ask the
+        # engine for routing/logprobs from window position 0 — otherwise the seed's routing is
+        # never returned and the reseeded segment can't be reconstructed/trained. See the flag
+        # def in __init__ + start_len in stream().
+        self._capture_seed_routing_next = True
 
     @property
     def trajectory_segment_call_starts(self) -> list[int]:
@@ -527,6 +540,16 @@ class SGLangModel(Model):
         active_prefix = self.token_manager.token_ids[active_base:]
         input_ids = active_prefix + new_input_ids
 
+        # First call after a reseed: ask for logprobs/routing from window position 0 so the
+        # masked seed prefix (already in active_prefix, appended out-of-band) is COVERED — its
+        # routing is needed to reconstruct + train the reseeded segment. One-shot; on every
+        # other call start_len sits at the boundary before new_input_ids (incremental, the
+        # tokens already in active_prefix were covered by earlier calls). Mirrors a fresh
+        # segment's first call (active_base==0, start_len 0). See reseed_inplace + __init__.
+        _seed_routing = self._capture_seed_routing_next
+        self._capture_seed_routing_next = False
+        _start_len = 0 if _seed_routing else max(0, len(active_prefix) - 1)
+
         # Slime-side token budgets: clamp this turn's max_new_tokens to the tightest remaining budget
         # so the trajectory can't grow unbounded toward the model's native context (the context cap is
         # only applied to the INITIAL prompt, so multi-turn trajectories -- esp. long-prefix resumes --
@@ -576,11 +599,9 @@ class SGLangModel(Model):
                 # pre-Phase-3 `len(token_manager.token_ids) - 1` on the single-segment path
                 # (active_base == 0), and resets per segment after a compaction reseed so each
                 # segment's routing reconstructs independently. See segment_tree_trajectories.md.
-                logprob_start_len=max(0, len(active_prefix) - 1) if return_logprob else None,
+                logprob_start_len=_start_len if return_logprob else None,
                 return_routed_experts=return_routed_experts,
-                routed_experts_start_len=(
-                    max(0, len(active_prefix) - 1) if return_routed_experts else 0
-                ),
+                routed_experts_start_len=(_start_len if return_routed_experts else 0),
                 image_data=self.image_data or None,
             )
 
