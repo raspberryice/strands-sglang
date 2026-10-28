@@ -268,3 +268,55 @@ class TestTokenManagerSeedPrefix:
             TokenManager().seed_prefix([1, 2, 3], [0, 1])
         with pytest.raises(ValueError, match="logprobs length"):
             TokenManager().seed_prefix([1, 2], [0, 1], [-0.1])
+
+
+class TestFlatIdCache:
+    """The flat id cache behind len() / token_ids stays equal to a full recompute."""
+
+    @staticmethod
+    def _recompute(tm):
+        return [t.token_id for seg in tm.segments for t in seg]
+
+    def test_random_mix_matches_recompute(self):
+        import random
+
+        rng = random.Random(0)
+        tm = TokenManager()
+        tm.add_prompt([rng.randrange(1000) for _ in range(5)])
+        for _ in range(300):
+            op = rng.random()
+            n = rng.randrange(1, 9)
+            ids = [rng.randrange(1000) for _ in range(n)]
+            if op < 0.45:
+                tm.add_prompt(ids)
+            elif op < 0.95:
+                tm.add_response(ids, [-0.1] * n)
+            else:
+                tm.reset()
+                tm.add_prompt(ids)
+            full = self._recompute(tm)
+            assert tm.token_ids == full and len(tm) == len(full)
+
+    def test_token_ids_is_a_copy(self):
+        tm = TokenManager()
+        tm.add_prompt([1, 2, 3])
+        ids = tm.token_ids
+        ids.append(99)
+        assert tm.token_ids == [1, 2, 3] and len(tm) == 3
+
+    def test_seed_prefix_and_reset(self):
+        tm = TokenManager()
+        tm.seed_prefix([1, 2, 3, 4], [0, 1, 1, 0])
+        assert tm.token_ids == [1, 2, 3, 4] and len(tm) == 4
+        tm.reset()
+        assert tm.token_ids == [] and len(tm) == 0
+
+    def test_direct_segment_append_is_picked_up(self):
+        from strands_sglang.token import Token
+
+        tm = TokenManager()
+        tm.add_prompt([1, 2])
+        tm.segments.append([Token(token_id=7, loss_mask=True)])  # bypasses add_*
+        assert tm.token_ids == [1, 2, 7] and len(tm) == 3
+        tm.add_response([8], [-0.1])
+        assert tm.token_ids == [1, 2, 7, 8]

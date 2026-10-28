@@ -15,6 +15,7 @@
 """Unit tests for SGLangClient (mocked, no server required)."""
 
 import asyncio
+import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -243,8 +244,10 @@ def _mock_response(status: int, body: str = "", json_data: dict | None = None):
     mock_resp.text = AsyncMock(return_value=body)
     if json_data is not None:
         mock_resp.json = AsyncMock(return_value=json_data)
+        mock_resp.read = AsyncMock(return_value=json.dumps(json_data).encode())
     else:
         mock_resp.json = AsyncMock(side_effect=Exception("Not JSON"))
+        mock_resp.read = AsyncMock(return_value=body.encode())
     mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
     mock_resp.__aexit__ = AsyncMock(return_value=None)
     return mock_resp
@@ -488,3 +491,46 @@ class TestExceptionHierarchy:
         assert error.status == 500
         assert error.body == "error body"
         assert str(error) == "test"
+
+
+class TestJsonCodec:
+    """orjson fast path with stdlib fallbacks: same values as stdlib json, NaN/Infinity and numpy still work."""
+
+    def test_roundtrip_matches_stdlib(self):
+        from strands_sglang.client import _dumps, _loads
+
+        payload = {"input_ids": list(range(1000)), "sampling_params": {"temperature": 1.0, "max_new_tokens": 49152},
+                   "return_logprob": True, "rid": "slime-1-abc", "image_data": None}
+        assert json.loads(_dumps(payload)) == payload
+        body = json.dumps({"text": "hi", "meta_info": {"output_token_logprobs": [[-0.5, 7, None]]}}).encode()
+        assert _loads(body) == json.loads(body)
+
+    def test_nan_and_infinity_fall_back_to_stdlib(self):
+        from strands_sglang.client import _loads
+
+        out = _loads(b'{"lp": [-Infinity, NaN, 1.5]}')
+        assert out["lp"][0] == float("-inf") and out["lp"][1] != out["lp"][1] and out["lp"][2] == 1.5
+
+    def test_numpy_scalars_encode(self):
+        pytest.importorskip("orjson")  # stdlib json (the fallback, and the old json= path) cannot encode numpy either
+        import numpy as np
+
+        from strands_sglang.client import _dumps
+
+        assert json.loads(_dumps({"input_ids": [np.int64(3), 4], "t": np.float32(0.5)})) == {"input_ids": [3, 4], "t": 0.5}
+
+    def test_invalid_body_raises(self):
+        from strands_sglang.client import _loads
+
+        with pytest.raises(ValueError):
+            _loads(b"<html>not json</html>")
+
+    async def test_generate_sends_encoded_body_with_content_type(self):
+        resp = _mock_response(200, json_data={"text": "ok", "output_ids": [1], "meta_info": {}})
+        client = _client_with_mock_session(resp)
+        out = await client.generate(input_ids=[1, 2, 3])
+        assert out["text"] == "ok"
+        kwargs = client._get_session.return_value.post.call_args.kwargs
+        assert json.loads(kwargs["data"])["input_ids"] == [1, 2, 3]
+        assert kwargs["headers"]["Content-Type"] == "application/json" and "json" not in kwargs
+

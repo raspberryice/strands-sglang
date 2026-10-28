@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -24,6 +25,31 @@ from contextvars import ContextVar
 from typing import Any
 
 import aiohttp
+
+try:  # orjson: ~6x faster encode / ~3x faster decode of the large /generate bodies on the rollout event loop
+    import orjson
+except ImportError:  # pragma: no cover - optional dependency
+    orjson = None
+
+
+def _dumps(payload: dict[str, Any]) -> bytes:
+    """Encode a request body (orjson when available; stdlib for anything orjson cannot serialize)."""
+    if orjson is not None:
+        try:
+            return orjson.dumps(payload, option=orjson.OPT_SERIALIZE_NUMPY)
+        except TypeError:
+            pass
+    return json.dumps(payload).encode()
+
+
+def _loads(body: bytes) -> Any:
+    """Decode a response body; stdlib fallback keeps accepting NaN/Infinity, which orjson rejects."""
+    if orjson is not None:
+        try:
+            return orjson.loads(body)
+        except orjson.JSONDecodeError:
+            pass
+    return json.loads(body)
 
 from .exceptions import (
     SGLangClientError,
@@ -296,17 +322,20 @@ class SGLangClient:
                 self._abort_at_deadline(rid, deadline, extra_headers, _abort_state)
             )
 
+        # Encode once (the payload, incl. rid, is identical across retries).
+        body_bytes = _dumps(payload)
+        headers = {**(extra_headers or {}), "Content-Type": "application/json"}
         try:
             for attempt in range(self.max_retries + 1):
                 try:
-                    async with session.post("/generate", json=payload, headers=extra_headers) as resp:
+                    async with session.post("/generate", data=body_bytes, headers=headers) as resp:
                         if resp.status >= 400:
                             body = await resp.text()
                             raise self._classify_http_error(resp.status, body)
 
                         # Success path: parse JSON directly
                         try:
-                            return await resp.json(content_type=None)
+                            return _loads(await resp.read())
                         except Exception as e:
                             # Non-JSON response — treat as retryable error
                             raise SGLangDecodingError(f"Invalid JSON response: {e}") from e

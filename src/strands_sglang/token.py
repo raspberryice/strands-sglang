@@ -55,10 +55,32 @@ class TokenManager:
     def __init__(self) -> None:
         """Create a TokenManager."""
         self._segments: list[list[Token]] = []
+        # Flat token-id cache, maintained on every append so `len()` and `token_ids` no longer
+        # rebuild the whole trajectory from per-token objects (several times per model call on the
+        # rollout event loop). `_cache_segments` = number of `_segments` the cache covers; a mismatch
+        # (a caller appended to `segments` directly) triggers a rebuild.
+        self._ids: list[int] = []
+        self._cache_segments = 0
 
     def reset(self) -> None:
         """Reset token accumulation for a new episode."""
         self._segments = []
+        self._ids = []
+        self._cache_segments = 0
+
+    def _push(self, tokens: list[Token]) -> None:
+        """Append one segment and extend the flat id cache."""
+        self._sync_cache()
+        self._segments.append(tokens)
+        self._ids.extend(t.token_id for t in tokens)
+        self._cache_segments = len(self._segments)
+
+    def _sync_cache(self) -> list[int]:
+        """Return the flat id cache, rebuilding it if `_segments` changed behind our back."""
+        if self._cache_segments != len(self._segments):
+            self._ids = [t.token_id for seg in self._segments for t in seg]
+            self._cache_segments = len(self._segments)
+        return self._ids
 
     def add_prompt(self, token_ids: list[int], logprobs: list[float] | None = None) -> None:
         """Add a prompt segment (system messages, user input, tool results)."""
@@ -75,7 +97,7 @@ class TokenManager:
             )
             for i, tid in enumerate(token_ids)
         ]
-        self._segments.append(tokens)
+        self._push(tokens)
 
     def add_response(self, token_ids: list[int], logprobs: list[float] | None = None) -> None:
         """Add a response segment (model output)."""
@@ -94,7 +116,7 @@ class TokenManager:
             )
             for i, tid in enumerate(token_ids)
         ]
-        self._segments.append(tokens)
+        self._push(tokens)
 
     def seed_prefix(
         self,
@@ -133,7 +155,7 @@ class TokenManager:
             j = i
             while j < n and bool(loss_mask[j]) == is_output:
                 j += 1
-            self._segments.append(
+            self._push(
                 [
                     Token(
                         token_id=token_ids[k],
@@ -152,8 +174,8 @@ class TokenManager:
 
     @property
     def token_ids(self) -> list[int]:
-        """Get all token IDs as a flat list."""
-        return [token.token_id for token in self.tokens]
+        """Get all token IDs as a flat list (a copy of the maintained cache)."""
+        return list(self._sync_cache())
 
     @property
     def loss_mask(self) -> list[int]:
@@ -191,7 +213,7 @@ class TokenManager:
 
     def __len__(self) -> int:
         """Return total number of tokens."""
-        return sum(len(seg) for seg in self._segments)
+        return len(self._sync_cache())
 
     def __repr__(self) -> str:
         """Return string representation."""

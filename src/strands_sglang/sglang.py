@@ -413,6 +413,7 @@ class SGLangModel(Model):
             is_multimodal=is_multimodal,
         )
         # Tracking token IDs in token_manager to ensure the token-in feature
+        n_prior = len(self.token_manager)
         input_ids = self.token_manager.token_ids + new_input_ids
 
         # Slime-side trajectory token budget: clamp this turn's max_new_tokens so the cumulative
@@ -441,14 +442,14 @@ class SGLangModel(Model):
                 input_ids=input_ids,
                 sampling_params=sampling_params,
                 return_logprob=return_logprob,
-                logprob_start_len=max(0, len(self.token_manager.token_ids) - 1) if return_logprob else None,
+                logprob_start_len=max(0, n_prior - 1) if return_logprob else None,
                 return_routed_experts=return_routed_experts,
                 # Mirror logprob_start_len: ask SGLang for routing only for positions
                 # newly introduced by this call. Avoids the O(N²) wire cost of
                 # re-sending the full cumulative sequence's routing on every multi-turn
                 # call. Server-side support added in our SGLang fork on `slime-slim`.
                 routed_experts_start_len=(
-                    max(0, len(self.token_manager.token_ids) - 1) if return_routed_experts else 0
+                    max(0, n_prior - 1) if return_routed_experts else 0
                 ),
                 image_data=self.image_data or None,
             )
