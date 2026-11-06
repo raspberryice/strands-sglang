@@ -54,40 +54,33 @@ class TokenManager:
 
     def __init__(self) -> None:
         """Create a TokenManager."""
-        self._segments: list[list[Token]] = []
+        # Flat, index-aligned storage (as upstream strands-sglang's `Rollout`, #65): ints/floats are not
+        # GC-tracked, so a whole trajectory is a handful of tracked lists instead of one tracked `Token`
+        # per token — the RolloutManager's full collections took 85-250 s with ~1e8-1e9 Token objects live.
+        # `Token` objects are only built on demand by the `tokens` / `segments` / `initial_prompt` views.
+        self._ids: list[int] = []
+        self._lps: list[float | None] = []
+        self._mask = bytearray()
+        self._seg_bounds: list[tuple[bool, int, int]] = []  # turn-segments: (is_output, start, end)
         # Trajectory-segment boundaries (token offsets), for in-loop compaction reseeds
         # (design/segment_tree_trajectories.md). A *trajectory-segment* is one context window
-        # between reseeds — coarser than the PROMPT/RESPONSE turn-segments in `_segments`. Always
+        # between reseeds — coarser than the PROMPT/RESPONSE turn-segments in `_seg_bounds`. Always
         # starts with [0]; `reseed_inplace` appends the token offset where each new segment begins.
         # With no reseed there is exactly one trajectory-segment ([0]) and behavior is unchanged.
         self._traj_seg_starts: list[int] = [0]
-        # Flat token-id cache + count, maintained on every append so `len()`, `token_ids` and the
-        # active-window slice no longer rebuild the whole trajectory from per-token objects (several
-        # times per turn on the rollout event loop). `_cache_segments` = number of `_segments` the
-        # cache covers; a mismatch (a caller appended to `segments` directly) triggers a rebuild.
-        self._ids: list[int] = []
-        self._cache_segments = 0
 
     def reset(self) -> None:
         """Reset token accumulation for a new episode."""
-        self._segments = []
+        self._ids, self._lps, self._mask, self._seg_bounds = [], [], bytearray(), []
         self._traj_seg_starts = [0]
-        self._ids = []
-        self._cache_segments = 0
 
-    def _push(self, tokens: list[Token]) -> None:
-        """Append one turn-segment and extend the flat id cache."""
-        self._sync_cache()
-        self._segments.append(tokens)
-        self._ids.extend(t.token_id for t in tokens)
-        self._cache_segments = len(self._segments)
-
-    def _sync_cache(self) -> list[int]:
-        """Return the flat id cache, rebuilding it if `_segments` changed behind our back."""
-        if self._cache_segments != len(self._segments):
-            self._ids = [t.token_id for seg in self._segments for t in seg]
-            self._cache_segments = len(self._segments)
-        return self._ids
+    def _push(self, token_ids: list[int], logprobs: list[float | None] | None, is_output: bool) -> None:
+        """Append one turn-segment (PROMPT if not `is_output`, else RESPONSE)."""
+        start = len(self._ids)
+        self._ids.extend(token_ids)
+        self._lps.extend(logprobs if logprobs is not None else [None] * len(token_ids))
+        self._mask.extend(b"\x01" * len(token_ids) if is_output else bytes(len(token_ids)))
+        self._seg_bounds.append((is_output, start, len(self._ids)))
 
     def _append_runs(
         self,
@@ -105,16 +98,7 @@ class TokenManager:
             j = i
             while j < n and bool(loss_mask[j]) == is_output:
                 j += 1
-            self._push(
-                [
-                    Token(
-                        token_id=token_ids[k],
-                        logprob=(logprobs[k] if logprobs is not None else None),
-                        loss_mask=is_output,
-                    )
-                    for k in range(i, j)
-                ]
-            )
+            self._push(token_ids[i:j], logprobs[i:j] if logprobs is not None else None, is_output)
             i = j
 
     def add_prompt(self, token_ids: list[int], logprobs: list[float] | None = None) -> None:
@@ -124,34 +108,18 @@ class TokenManager:
         if logprobs is not None and len(logprobs) != len(token_ids):
             raise ValueError(f"logprobs length ({len(logprobs)}) must match token_ids length ({len(token_ids)})")
 
-        tokens = [
-            Token(
-                token_id=tid,
-                logprob=logprobs[i] if logprobs is not None else None,
-                loss_mask=False,
-            )
-            for i, tid in enumerate(token_ids)
-        ]
-        self._push(tokens)
+        self._push(list(token_ids), list(logprobs) if logprobs is not None else None, False)
 
     def add_response(self, token_ids: list[int], logprobs: list[float] | None = None) -> None:
         """Add a response segment (model output)."""
         if not token_ids:
             return
-        if not self._segments:
+        if not self._seg_bounds:
             raise RuntimeError("First segment must be a prompt. Call add_prompt() before add_response().")
         if logprobs is not None and len(logprobs) != len(token_ids):
             raise ValueError(f"logprobs length ({len(logprobs)}) must match token_ids length ({len(token_ids)})")
 
-        tokens = [
-            Token(
-                token_id=tid,
-                logprob=logprobs[i] if logprobs is not None else None,
-                loss_mask=True,
-            )
-            for i, tid in enumerate(token_ids)
-        ]
-        self._push(tokens)
+        self._push(list(token_ids), list(logprobs) if logprobs is not None else None, True)
 
     def seed_prefix(
         self,
@@ -176,7 +144,7 @@ class TokenManager:
             RuntimeError: if the manager is not fresh.
             ValueError: on a length mismatch.
         """
-        if self._segments:
+        if self._seg_bounds:
             raise RuntimeError("seed_prefix() requires a fresh TokenManager (call before any add_*/after reset()).")
         if len(loss_mask) != len(token_ids):
             raise ValueError(f"loss_mask length ({len(loss_mask)}) must match token_ids length ({len(token_ids)})")
@@ -198,7 +166,7 @@ class TokenManager:
         the SAME rollout session on a compact `[problem + summary]` context. Unlike `seed_prefix`
         (which needs a fresh manager), this runs MID-episode:
 
-          * the already-accumulated turn-segments STAY in `_segments` — they are the archived
+          * the already-accumulated turn-segments STAY in `_seg_bounds` — they are the archived
             trajectory-segment, emitted later as its own training `Sample` (the bridge slices
             per-segment via `trajectory_segment_bounds`);
           * a new boundary is recorded at the current token count, so `active_base_offset` moves
@@ -218,7 +186,7 @@ class TokenManager:
             RuntimeError: on an empty manager (nothing to compact).
             ValueError: on a length mismatch.
         """
-        if not self._segments:
+        if not self._seg_bounds:
             raise RuntimeError("reseed_inplace() requires an existing trajectory (nothing to compact).")
         if len(loss_mask) != len(token_ids):
             raise ValueError(f"loss_mask length ({len(loss_mask)}) must match token_ids length ({len(token_ids)})")
@@ -253,19 +221,24 @@ class TokenManager:
         ends = starts[1:] + [len(self)]
         return list(zip(starts, ends))
 
+    def _tokens(self, start: int, end: int) -> list[Token]:
+        """`Token` view of `[start, end)` (built on demand; nothing per-token is stored)."""
+        ids, lps, mask = self._ids, self._lps, self._mask
+        return [Token(token_id=ids[k], logprob=lps[k], loss_mask=bool(mask[k])) for k in range(start, end)]
+
     @property
     def tokens(self) -> list[Token]:
-        """Get all tokens as a flat list."""
-        return [token for segment in self._segments for token in segment]
+        """Get all tokens as a flat list (a fresh view)."""
+        return self._tokens(0, len(self._ids))
 
     @property
     def token_ids(self) -> list[int]:
-        """Get all token IDs as a flat list (a copy of the maintained cache)."""
-        return list(self._sync_cache())
+        """Get all token IDs as a flat list (a copy)."""
+        return list(self._ids)
 
     def token_ids_from(self, start: int) -> list[int]:
         """Token IDs from `start` to the end (e.g. the active window `active_base_offset:`)."""
-        return self._sync_cache()[start:]
+        return self._ids[start:]
 
     @property
     def loss_mask(self) -> list[int]:
@@ -274,12 +247,12 @@ class TokenManager:
         Notes:
             Only compute loss on tokens where mask is 1 (model outputs).
         """
-        return [int(token.loss_mask) for token in self.tokens]
+        return list(self._mask)
 
     @property
     def logprobs(self) -> list[float | None]:
         """Get log probabilities for all tokens."""
-        return [token.logprob for token in self.tokens]
+        return list(self._lps)
 
     @property
     def initial_prompt(self) -> list[Token]:
@@ -289,25 +262,33 @@ class TokenManager:
             Contains the full input context from the first generation call:
             system prompt + tool definitions + user message (or conversation history).
         """
-        return self._segments[0] if self._segments else []
+        if not self._seg_bounds:
+            return []
+        _, start, end = self._seg_bounds[0]
+        return self._tokens(start, end)
+
+    @property
+    def initial_prompt_length(self) -> int:
+        """Length of `initial_prompt`, without building it."""
+        return self._seg_bounds[0][2] - self._seg_bounds[0][1] if self._seg_bounds else 0
 
     @property
     def segments(self) -> list[list[Token]]:
-        """Get tokens organized by segment."""
-        return self._segments
+        """Get tokens organized by segment (a fresh view; appending to it does not change the manager)."""
+        return [self._tokens(start, end) for _, start, end in self._seg_bounds]
 
     @property
     def segment_info(self) -> list[tuple[bool, int]]:
         """Get segment metadata as `(is_output, length)` tuples."""
-        return [(seg[0].loss_mask if seg else False, len(seg)) for seg in self._segments]
+        return [(is_output, end - start) for is_output, start, end in self._seg_bounds]
 
     def __len__(self) -> int:
         """Return total number of tokens."""
-        return len(self._sync_cache())
+        return len(self._ids)
 
     def __repr__(self) -> str:
         """Return string representation."""
-        n_segments = len(self._segments)
+        n_segments = len(self._seg_bounds)
         n_tokens = len(self)
-        n_output = sum(1 for token in self.tokens if token.loss_mask)
+        n_output = self._mask.count(1)
         return f"TokenManager(segments={n_segments}, tokens={n_tokens}, output_tokens={n_output})"

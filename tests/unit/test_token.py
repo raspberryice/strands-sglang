@@ -392,12 +392,16 @@ class TestFlatIdCache:
         tm.reset()
         assert tm.token_ids == [] and len(tm) == 0 and tm.token_ids_from(0) == []
 
-    def test_direct_segment_append_is_picked_up(self):
+    def test_segments_is_a_view_and_storage_is_flat(self):
+        import gc
+
         from strands_sglang.token import Token
 
         tm = TokenManager()
         tm.add_prompt([1, 2])
-        tm.segments.append([Token(token_id=7, loss_mask=True)])  # bypasses add_*
-        assert tm.token_ids == [1, 2, 7] and len(tm) == 3
         tm.add_response([8], [-0.1])
-        assert tm.token_ids == [1, 2, 7, 8]
+        tm.segments.append([Token(token_id=7, loss_mask=True)])  # a fresh view: does not change the manager
+        assert tm.token_ids == [1, 2, 8] and len(tm) == 3 and tm.segment_info == [(False, 2), (True, 1)]
+        assert tm.initial_prompt_length == len(tm.initial_prompt) == 2
+        # no per-token GC-tracked objects are stored (ints / floats / bytearray only)
+        assert not any(isinstance(x, Token) for x in gc.get_referents(*vars(tm).values()))
