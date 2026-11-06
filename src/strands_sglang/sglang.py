@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import (
     Any,
+    Literal,
     TypedDict,
     TypeVar,
     cast,
@@ -90,7 +91,9 @@ class SGLangModel(Model):
         return_routed_experts: bool | None  # Return MoE routed expert indices (default: False)
         enable_thinking: bool | None  # Enable thinking mode for Qwen3 hybrid models
         preserve_thinking: bool | None  # Keep <think> in history turns on re-render (resume alignment)
-        max_trajectory_tokens: int | None  # Cap cumulative trajectory tokens (prompt+gen); None = off
+        max_trajectory_tokens: int | None  # Cap prompt, tool, and generated tokens; None = off
+        token_budget_scope: Literal["episode", "context"]  # Whether archived contexts count (default: context)
+        max_segment_tokens: int | None  # Cap per-segment tokens (compaction trigger); None = off
 
     def __init__(
         self,
@@ -115,6 +118,7 @@ class SGLangModel(Model):
         self.tokenizer = tokenizer
         self.tool_parser = tool_parser or HermesToolParser()
         self.config = dict(config)
+        self._validate_token_budget_scope(self.config.get("token_budget_scope", "context"))
         self._chat_template_kwargs: dict[str, Any] = {
             "tokenize": False,
             "enable_thinking": self.config.get("enable_thinking", True),
@@ -144,6 +148,27 @@ class SGLangModel(Model):
         # `pause_generation(mode="abort")` must not train as a reward-0 completion).
         self.finish_reasons: list[str | None] = []
         self.message_count: int = 0
+        # In-loop compaction (design/segment_tree_trajectories.md, Phase 3). A stream()-call
+        # counter and the per-call indices at which each trajectory-segment's generation begins
+        # (always starts [0]). `reseed_inplace` appends a boundary so the bridge can partition the
+        # per-call routing / top-p payloads by segment for independent reconstruction. With no
+        # reseed there is one segment ([0]) and every path below is byte-identical.
+        self._stream_call_count: int = 0
+        self._traj_seg_call_starts: list[int] = [0]
+        # Compaction reseed support: the render context of the last stream() call (reused to
+        # tokenize the compacted [problem+summary] seed identically), and a one-shot flag telling
+        # the next tokenize_prompt_messages to emit no new tokens (generate straight from the
+        # freshly-seeded active window). Both inert unless compact_reseed() is called.
+        self._last_tool_specs: list[ToolSpec] | None = None
+        self._last_system_prompt: str | None = None
+        self._generate_from_window_next: bool = False
+        # One-shot: the next stream() call after a reseed sends logprob/routing start_len=0
+        # so the engine returns routing over the ENTIRE active window — including the masked
+        # seed prefix, which was appended out-of-band (not as a call's new_input_ids) and so
+        # would otherwise be skipped by the incremental start_len. This makes a reseeded
+        # segment's per-call routing concatenate to seg_len-1 (like a fresh segment's first
+        # call), so the bridge can reconstruct + TRAIN it. Inert unless reseed_inplace() runs.
+        self._capture_seed_routing_next: bool = False
         self.tool_parse_errors: dict[str, int] = {}  # per-tool parse error count
         self.image_data: list[str] = []  # accumulated image data URLs (VLM only)
         # Optional resume-in-place seed (aborted-trajectory replay): seeds token_manager +
@@ -167,6 +192,12 @@ class SGLangModel(Model):
         """Reset all state for a new episode."""
         self.token_manager.reset()
         self.message_count = 0
+        self._stream_call_count = 0
+        self._traj_seg_call_starts = [0]
+        self._last_tool_specs = None
+        self._last_system_prompt = None
+        self._generate_from_window_next = False
+        self._capture_seed_routing_next = False
         self.tool_parse_errors = {}
         self.image_data = []
         self.routed_experts_per_call = []
@@ -189,6 +220,116 @@ class SGLangModel(Model):
         self.token_manager.seed_prefix(seed.token_ids, seed.loss_mask, seed.logprobs)
         self.message_count = seed.message_count
 
+    def reseed_inplace(
+        self,
+        seed_token_ids: list[int],
+        seed_loss_mask: list[int],
+        seed_logprobs: list[float | None] | None = None,
+        *,
+        new_message_count: int,
+    ) -> None:
+        """In-loop compaction reseed (design/segment_tree_trajectories.md, Phase 3).
+
+        Close the active trajectory-segment and continue the SAME rollout session on a compact
+        `[problem + summary]` window. Coordinates the three pieces of state that must move together:
+
+          1. `token_manager.reseed_inplace(...)` — archive the current segment's turns (they become
+             their own training Sample) and start a fresh active window seeded with `seed_token_ids`
+             (the summary is passed `loss_mask=0` — masked context in the new segment).
+          2. `_traj_seg_call_starts` — record the stream()-call index at which the new segment's
+             generation begins, so the bridge partitions the per-call routing / top-p payloads by
+             segment (each segment's routing reconstructs independently against its own tokens).
+          3. `message_count` — reset so `tokenize_prompt_messages` tokenizes only the messages the
+             CALLER left after the compacted prefix (the caller rewrites `agent.messages` to the
+             compacted list and passes its length here).
+
+        The caller (the compaction hook) is responsible for: building `seed_token_ids` (problem +
+        the just-generated summary, re-rendered as a clean masked prefix) and rewriting
+        `agent.messages` to match. `active_base_offset` then makes `stream()` send only the compact
+        window to `/generate`, dropping the old KV.
+        """
+        self.token_manager.reseed_inplace(seed_token_ids, seed_loss_mask, seed_logprobs)
+        self._traj_seg_call_starts.append(self._stream_call_count)
+        self.message_count = int(new_message_count)
+        # The seed was appended out-of-band (no /generate call), so the next call must ask the
+        # engine for routing/logprobs from window position 0 — otherwise the seed's routing is
+        # never returned and the reseeded segment can't be reconstructed/trained. See the flag
+        # def in __init__ + start_len in stream().
+        self._capture_seed_routing_next = True
+
+    @property
+    def trajectory_segment_call_starts(self) -> list[int]:
+        """Per-call indices where each trajectory-segment's generation begins (for the bridge's
+        per-segment routing/top-p partition). Always starts [0]; one extra entry per reseed."""
+        return list(self._traj_seg_call_starts)
+
+    def compact_reseed(
+        self,
+        compacted_messages: Messages,
+        *,
+        is_multimodal: bool = False,
+        remaining_budget: int | None = None,
+        min_remaining_tokens: int = 0,
+    ) -> bool:
+        """Compaction reseed from a compacted message list (design/segment_tree_trajectories.md).
+
+        Tokenizes `compacted_messages` (e.g. [problem, assistant(summary)]) via the SAME full-render
+        path a fresh episode's first turn uses (system prompt + tools + add_generation_prompt),
+        reusing the render context of the last stream() call so the seed is byte-consistent with
+        what the model then generates from. The seed is installed as the new active window with
+        `loss_mask=0` (masked context — the new segment trains only its OWN generated tokens), and
+        a one-shot flag makes the next stream() emit no new prompt tokens (generate straight from
+        the seeded window). The caller (the compaction hook) must set `agent.messages` to exactly
+        `compacted_messages` so subsequent incremental tokenization stays aligned (message_count is
+        set to len(compacted_messages) here).
+
+        If remaining_budget is provided, return False without installing the seed unless it
+        leaves at least min_remaining_tokens for generation (and always at least one token).
+        In episode scope the caller supplies the budget remaining after archived tokens. In
+        context scope the new context receives a fresh max_trajectory_tokens budget, including
+        the entire rendered seed; remaining_budget, if supplied, can further restrict it.
+        Return True after a successful reseed. In episode scope an omitted remaining_budget
+        retains legacy admission behavior; stream() still enforces the cumulative cap.
+
+        LIVE-VALIDATE: the seed must reproduce the exact tokens the server prefILLs; verify in a
+        1-node isolation run that the new segment's per-token logprobs/routing align.
+        """
+        saved_count = self.message_count
+        saved_generate_from_window = self._generate_from_window_next
+        saved_image_data = self.image_data
+        self.message_count = 0  # force the full-render (first-call) tokenization path
+        self._generate_from_window_next = False
+        self.image_data = list(saved_image_data)
+        try:
+            seed_token_ids = self.tokenize_prompt_messages(
+                messages=compacted_messages,
+                system_prompt=self._last_system_prompt,
+                tool_specs=self._last_tool_specs,
+                is_multimodal=is_multimodal,
+            )
+            seeded_image_data = self.image_data
+        finally:
+            self.message_count = saved_count
+            self._generate_from_window_next = saved_generate_from_window
+            self.image_data = saved_image_data
+        budgets = [] if remaining_budget is None else [remaining_budget]
+        if self.config.get("token_budget_scope", "context") == "context":
+            context_cap = self.config.get("max_trajectory_tokens")
+            if context_cap:
+                budgets.append(int(context_cap))
+        if budgets and min(budgets) - len(seed_token_ids) < max(1, min_remaining_tokens):
+            return False
+        # Masked seed: the new segment conditions on it but never trains it (it's prompt context).
+        self.reseed_inplace(
+            seed_token_ids,
+            [0] * len(seed_token_ids),
+            None,
+            new_message_count=len(compacted_messages),
+        )
+        self.image_data = seeded_image_data
+        self._generate_from_window_next = True
+        return True
+
     # -------------------------------------------------------------------------
     # Model interface implementation
     # -------------------------------------------------------------------------
@@ -196,7 +337,13 @@ class SGLangModel(Model):
     @override
     def update_config(self, **model_config: Unpack[SGLangConfig]) -> None:  # type: ignore[override]
         """Update the model configuration."""
+        self._validate_token_budget_scope(model_config.get("token_budget_scope", "context"))
         self.config.update(model_config)
+
+    @staticmethod
+    def _validate_token_budget_scope(scope: str) -> None:
+        if scope not in ("episode", "context"):
+            raise ValueError(f"token_budget_scope must be 'episode' or 'context', got {scope!r}")
 
     @override
     def get_config(self) -> SGLangConfig:
@@ -331,6 +478,13 @@ class SGLangModel(Model):
             then subtracts it to extract only incremental tokens.
         """
 
+        # Compaction: right after a reseed the active window already ends with an assistant
+        # generation prompt, so there is nothing new to tokenize — emit [] and let stream()
+        # generate straight from the seeded window. One-shot (cleared here). See compact_reseed.
+        if self._generate_from_window_next:
+            self._generate_from_window_next = False
+            return []
+
         # TODO: add support for other modalities (e.g. audio, video, etc.)
         def update_multimodal_data(hf_messages: list[dict[str, Any]]) -> None:
             if not is_multimodal:
@@ -406,31 +560,67 @@ class SGLangModel(Model):
         return_logprob = config.get("return_logprob", True)
         return_routed_experts = config.get("return_routed_experts", False)
         is_multimodal = await self.client.is_multimodal()
+        # Stash the render context so a mid-loop compaction reseed can re-tokenize the compacted
+        # [problem+summary] seed with byte-identical system-prompt/tool framing (compact_reseed).
+        self._last_tool_specs = tool_specs
+        self._last_system_prompt = system_prompt
         new_input_ids = self.tokenize_prompt_messages(
             messages=messages,
             system_prompt=system_prompt,
             tool_specs=tool_specs,
             is_multimodal=is_multimodal,
         )
-        # Tracking token IDs in token_manager to ensure the token-in feature
-        n_prior = len(self.token_manager)
-        input_ids = self.token_manager.token_ids + new_input_ids
+        self._stream_call_count += 1
+        # Active-window token-in (design/segment_tree_trajectories.md, Phase 3): after an in-loop
+        # compaction reseed, send only the ACTIVE trajectory-segment's tokens (the compact
+        # [problem+summary] prefix + this segment's turns so far) to /generate, dropping the old
+        # history's KV. `active_base_offset` is 0 until the first reseed, so this is byte-identical
+        # to `token_manager.token_ids + new_input_ids` on the (default) single-segment path.
+        active_base = self.token_manager.active_base_offset
+        active_prefix = self.token_manager.token_ids_from(active_base)
+        input_ids = active_prefix + new_input_ids
 
-        # Slime-side trajectory token budget: clamp this turn's max_new_tokens so the cumulative
-        # trajectory (prompt + all generation) never exceeds max_trajectory_tokens. The context cap
-        # is only applied to the initial prompt, so multi-turn trajectories -- especially resumes
-        # seeded with a long prefix -- otherwise grow unbounded toward the model's native context.
-        # None -> off (legacy). When the budget is reached, truncate the same way a real context
-        # overflow does (TRUNCATED, trainable), instead of cutting the next turn mid-generation.
+        # First call after a reseed: ask for logprobs/routing from window position 0 so the
+        # masked seed prefix (already in active_prefix, appended out-of-band) is COVERED — its
+        # routing is needed to reconstruct + train the reseeded segment. One-shot; on every
+        # other call start_len sits at the boundary before new_input_ids (incremental, the
+        # tokens already in active_prefix were covered by earlier calls). Mirrors a fresh
+        # segment's first call (active_base==0, start_len 0). See reseed_inplace + __init__.
+        _seed_routing = self._capture_seed_routing_next
+        self._capture_seed_routing_next = False
+        _start_len = 0 if _seed_routing else max(0, len(active_prefix) - 1)
+
+        # Slime-side token budgets: clamp this turn's max_new_tokens to the tightest remaining budget
+        # so the trajectory can't grow unbounded toward the model's native context (the context cap is
+        # only applied to the INITIAL prompt, so multi-turn trajectories -- esp. long-prefix resumes --
+        # otherwise grow without bound). Two budgets (both None -> off, legacy):
+        #   * max_trajectory_tokens: prompt + tools + generation, across all segments in episode
+        #       scope, or only the active window in context scope (the default).
+        #   * max_segment_tokens: the ACTIVE segment only (compaction trigger), in either scope.
+        # Reaching EITHER ends the turn/trajectory as TRUNCATED (trainable) -- the same path a real
+        # context overflow takes -- instead of cutting the next turn mid-generation. Phase 3 will
+        # intercept the segment threshold in the AfterModelCallEvent hook (inject summary + reseed_inplace)
+        # BEFORE this clamp would raise; the clamp remains the terminal backstop.
+        _budgets: list[tuple[str, int, int]] = []  # (name, cap, remaining)
         max_traj = config.get("max_trajectory_tokens")
         if max_traj:
-            remaining = int(max_traj) - len(input_ids)
-            if remaining <= 0:
+            context_scope = config.get("token_budget_scope", "context") == "context"
+            charged_tokens = len(input_ids) if context_scope else len(self.token_manager) + len(new_input_ids)
+            _budgets.append(("context" if context_scope else "trajectory", int(max_traj), int(max_traj) - charged_tokens))
+        max_seg = config.get("max_segment_tokens")
+        if max_seg:
+            # Active-segment tokens = the compact window we actually send this turn.
+            _active_seg_tokens = len(input_ids)
+            _budgets.append(("segment", int(max_seg), int(max_seg) - _active_seg_tokens))
+        for _name, _cap, _rem in _budgets:
+            if _rem <= 0:
                 raise ContextWindowOverflowException(
-                    f"trajectory token budget {max_traj} reached (prompt={len(input_ids)})"
+                    f"{_name} token budget {_cap} reached (prompt={len(input_ids)})"
                 )
+        if _budgets:
+            _rem_min = min(_rem for _, _, _rem in _budgets)
             _cur = sampling_params.get("max_new_tokens")
-            sampling_params["max_new_tokens"] = remaining if _cur is None else min(int(_cur), remaining)
+            sampling_params["max_new_tokens"] = _rem_min if _cur is None else min(int(_cur), _rem_min)
 
         # Assistant message start
         yield {"messageStart": {"role": "assistant"}}
@@ -442,15 +632,15 @@ class SGLangModel(Model):
                 input_ids=input_ids,
                 sampling_params=sampling_params,
                 return_logprob=return_logprob,
-                logprob_start_len=max(0, n_prior - 1) if return_logprob else None,
+                # start_len is relative to `input_ids` (the ACTIVE window): the tokens already in
+                # the active prefix are `active_prefix`, so ask the server for logprobs/routing from
+                # its last token onward (covers new_input_ids + the generated output). Equals the
+                # pre-Phase-3 `len(token_manager.token_ids) - 1` on the single-segment path
+                # (active_base == 0), and resets per segment after a compaction reseed so each
+                # segment's routing reconstructs independently. See segment_tree_trajectories.md.
+                logprob_start_len=_start_len if return_logprob else None,
                 return_routed_experts=return_routed_experts,
-                # Mirror logprob_start_len: ask SGLang for routing only for positions
-                # newly introduced by this call. Avoids the O(N²) wire cost of
-                # re-sending the full cumulative sequence's routing on every multi-turn
-                # call. Server-side support added in our SGLang fork on `slime-slim`.
-                routed_experts_start_len=(
-                    max(0, n_prior - 1) if return_routed_experts else 0
-                ),
+                routed_experts_start_len=(_start_len if return_routed_experts else 0),
                 image_data=self.image_data or None,
             )
 

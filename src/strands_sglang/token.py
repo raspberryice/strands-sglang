@@ -55,21 +55,28 @@ class TokenManager:
     def __init__(self) -> None:
         """Create a TokenManager."""
         self._segments: list[list[Token]] = []
-        # Flat token-id cache, maintained on every append so `len()` and `token_ids` no longer
-        # rebuild the whole trajectory from per-token objects (several times per model call on the
-        # rollout event loop). `_cache_segments` = number of `_segments` the cache covers; a mismatch
-        # (a caller appended to `segments` directly) triggers a rebuild.
+        # Trajectory-segment boundaries (token offsets), for in-loop compaction reseeds
+        # (design/segment_tree_trajectories.md). A *trajectory-segment* is one context window
+        # between reseeds — coarser than the PROMPT/RESPONSE turn-segments in `_segments`. Always
+        # starts with [0]; `reseed_inplace` appends the token offset where each new segment begins.
+        # With no reseed there is exactly one trajectory-segment ([0]) and behavior is unchanged.
+        self._traj_seg_starts: list[int] = [0]
+        # Flat token-id cache + count, maintained on every append so `len()`, `token_ids` and the
+        # active-window slice no longer rebuild the whole trajectory from per-token objects (several
+        # times per turn on the rollout event loop). `_cache_segments` = number of `_segments` the
+        # cache covers; a mismatch (a caller appended to `segments` directly) triggers a rebuild.
         self._ids: list[int] = []
         self._cache_segments = 0
 
     def reset(self) -> None:
         """Reset token accumulation for a new episode."""
         self._segments = []
+        self._traj_seg_starts = [0]
         self._ids = []
         self._cache_segments = 0
 
     def _push(self, tokens: list[Token]) -> None:
-        """Append one segment and extend the flat id cache."""
+        """Append one turn-segment and extend the flat id cache."""
         self._sync_cache()
         self._segments.append(tokens)
         self._ids.extend(t.token_id for t in tokens)
@@ -81,6 +88,34 @@ class TokenManager:
             self._ids = [t.token_id for seg in self._segments for t in seg]
             self._cache_segments = len(self._segments)
         return self._ids
+
+    def _append_runs(
+        self,
+        token_ids: list[int],
+        loss_mask: list[int],
+        logprobs: list[float | None] | None,
+    ) -> None:
+        """Append `token_ids` as alternating PROMPT/RESPONSE turn-segments split at `loss_mask`
+        run boundaries (0 -> PROMPT/masked, 1 -> RESPONSE/trained). Shared by `seed_prefix` and
+        `reseed_inplace`."""
+        n = len(token_ids)
+        i = 0
+        while i < n:
+            is_output = bool(loss_mask[i])
+            j = i
+            while j < n and bool(loss_mask[j]) == is_output:
+                j += 1
+            self._push(
+                [
+                    Token(
+                        token_id=token_ids[k],
+                        logprob=(logprobs[k] if logprobs is not None else None),
+                        loss_mask=is_output,
+                    )
+                    for k in range(i, j)
+                ]
+            )
+            i = j
 
     def add_prompt(self, token_ids: list[int], logprobs: list[float] | None = None) -> None:
         """Add a prompt segment (system messages, user input, tool results)."""
@@ -148,24 +183,75 @@ class TokenManager:
         if logprobs is not None and len(logprobs) != len(token_ids):
             raise ValueError(f"logprobs length ({len(logprobs)}) must match token_ids length ({len(token_ids)})")
 
-        n = len(token_ids)
-        i = 0
-        while i < n:
-            is_output = bool(loss_mask[i])
-            j = i
-            while j < n and bool(loss_mask[j]) == is_output:
-                j += 1
-            self._push(
-                [
-                    Token(
-                        token_id=token_ids[k],
-                        logprob=(logprobs[k] if logprobs is not None else None),
-                        loss_mask=is_output,
-                    )
-                    for k in range(i, j)
-                ]
-            )
-            i = j
+        self._append_runs(token_ids, loss_mask, logprobs)
+
+    def reseed_inplace(
+        self,
+        token_ids: list[int],
+        loss_mask: list[int],
+        logprobs: list[float | None] | None = None,
+    ) -> None:
+        """Close the ACTIVE trajectory-segment and start a fresh one seeded with `token_ids`.
+
+        The in-loop compaction reseed (design/segment_tree_trajectories.md): after a
+        length-triggered summary turn, drop the history the model conditions on and continue in
+        the SAME rollout session on a compact `[problem + summary]` context. Unlike `seed_prefix`
+        (which needs a fresh manager), this runs MID-episode:
+
+          * the already-accumulated turn-segments STAY in `_segments` — they are the archived
+            trajectory-segment, emitted later as its own training `Sample` (the bridge slices
+            per-segment via `trajectory_segment_bounds`);
+          * a new boundary is recorded at the current token count, so `active_base_offset` moves
+            to the start of the seed — the model then sends only `token_ids[active_base_offset:]`
+            to `/generate`, dropping the old KV;
+          * the seed is appended as PROMPT/RESPONSE runs. A compaction summary is passed with
+            `loss_mask=0` (masked context — regenerated as prompt for the child, never trained
+            in the child), matching the "trained in the emitting segment, masked in the seed"
+            rule.
+
+        Args:
+            token_ids: the compacted seed prefix (e.g. problem + summary [+ code]).
+            loss_mask: per-token mask (0 = masked/prompt, 1 = trained/response).
+            logprobs: per-token log-probs; `None` (or `None` entries) allowed for masked tokens.
+
+        Raises:
+            RuntimeError: on an empty manager (nothing to compact).
+            ValueError: on a length mismatch.
+        """
+        if not self._segments:
+            raise RuntimeError("reseed_inplace() requires an existing trajectory (nothing to compact).")
+        if len(loss_mask) != len(token_ids):
+            raise ValueError(f"loss_mask length ({len(loss_mask)}) must match token_ids length ({len(token_ids)})")
+        if logprobs is not None and len(logprobs) != len(token_ids):
+            raise ValueError(f"logprobs length ({len(logprobs)}) must match token_ids length ({len(token_ids)})")
+
+        self._traj_seg_starts.append(len(self))  # boundary at the current end (token units)
+        self._append_runs(token_ids, loss_mask, logprobs)
+
+    @property
+    def active_base_offset(self) -> int:
+        """Token index where the ACTIVE trajectory-segment begins (0 before any reseed).
+
+        The `SGLangModel` sends only `token_ids[active_base_offset:]` to `/generate` after a
+        compaction reseed, so the dropped history no longer costs KV / prefill.
+        """
+        return self._traj_seg_starts[-1]
+
+    @property
+    def n_trajectory_segments(self) -> int:
+        """Number of trajectory-segments (1 + number of compaction reseeds)."""
+        return len(self._traj_seg_starts)
+
+    @property
+    def trajectory_segment_bounds(self) -> list[tuple[int, int]]:
+        """`[start, end)` token ranges of each trajectory-segment; tiles `token_ids` exactly.
+
+        The bridge slices `token_ids` / `loss_mask` / `logprobs` by these ranges to emit one
+        training `Sample` per trajectory-segment (each trained with its OWN compacted context).
+        """
+        starts = self._traj_seg_starts
+        ends = starts[1:] + [len(self)]
+        return list(zip(starts, ends))
 
     @property
     def tokens(self) -> list[Token]:
@@ -176,6 +262,10 @@ class TokenManager:
     def token_ids(self) -> list[int]:
         """Get all token IDs as a flat list (a copy of the maintained cache)."""
         return list(self._sync_cache())
+
+    def token_ids_from(self, start: int) -> list[int]:
+        """Token IDs from `start` to the end (e.g. the active window `active_base_offset:`)."""
+        return self._sync_cache()[start:]
 
     @property
     def loss_mask(self) -> list[int]:

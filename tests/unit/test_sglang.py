@@ -463,3 +463,137 @@ class TestStreamFinishReason:
         # Recorded BEFORE the raise so the bridge's logging_info + partial-state
         # diagnostics survive the abort.
         assert model.finish_reasons == ["abort"]
+
+
+async def test_compaction_does_not_reset_explicit_episode_budget(mock_tokenizer):
+    model, client = _make_model_with_mock_client(
+        mock_tokenizer, sampling_params={"max_new_tokens": 50}, max_trajectory_tokens=10,
+        token_budget_scope="episode",
+    )
+    model.token_manager.add_prompt([1, 2, 3])
+    model.token_manager.add_response([4, 5], [-0.1, -0.2])
+    messages = [{"role": "user", "content": [{"text": "problem"}]}]
+    # Full archived history=5, new compacted seed=5: the outer wall is exhausted.
+    model.compact_reseed(messages)
+    from strands.types.exceptions import ContextWindowOverflowException
+
+    with pytest.raises(ContextWindowOverflowException):
+        async for _ in model.stream(messages):
+            pass
+    client.generate.assert_not_called()
+
+
+@pytest.mark.parametrize("scope_config", [{}, {"token_budget_scope": "context"}])
+async def test_context_budget_resets_to_full_cap_minus_rendered_seed(mock_tokenizer, scope_config):
+    model, client = _make_model_with_mock_client(
+        mock_tokenizer, sampling_params={"max_new_tokens": 50},
+        max_trajectory_tokens=10, **scope_config,
+    )
+    model.token_manager.add_prompt(list(range(30)))
+    messages = [{"role": "user", "content": [{"text": "problem"}]}]
+    for _ in range(2):
+        # A rendered five-token seed leaves five generation tokens regardless of archive size.
+        assert model.compact_reseed(messages)
+        async for _ in model.stream(messages):
+            pass
+        assert client.generate.call_args.kwargs["sampling_params"]["max_new_tokens"] == 5
+        assert client.generate.call_args.kwargs["input_ids"] == [1, 2, 3, 4, 5]
+
+
+async def test_context_budget_charges_active_tool_result_tokens(mock_tokenizer):
+    model, client = _make_model_with_mock_client(
+        mock_tokenizer, sampling_params={"max_new_tokens": 50},
+        max_trajectory_tokens=15, token_budget_scope="context",
+    )
+    model.__dict__["message_separator"] = ""
+    model.token_manager.add_prompt(list(range(30)))
+    messages = [{"role": "user", "content": [{"text": "problem"}]}]
+    assert model.compact_reseed(messages)
+    async for _ in model.stream(messages):
+        pass
+    # The current seed (5), response (2), and next tool input (5) all consume this context's cap.
+    messages.extend([
+        {"role": "assistant", "content": [{"text": "hello"}]},
+        {"role": "user", "content": [
+            {"toolResult": {"toolUseId": "call_0", "content": [{"text": "tool output"}]}}
+        ]},
+    ])
+    async for _ in model.stream(messages):
+        pass
+    assert client.generate.call_args.kwargs["sampling_params"]["max_new_tokens"] == 3
+    assert len(client.generate.call_args.kwargs["input_ids"]) == 12
+
+
+@pytest.mark.parametrize("context_cap,remaining,reserve,accepted", [
+    (5, None, 0, False), (6, None, 0, True), (8, None, 4, False),
+    (9, None, 4, True), (6, 100, 2, False), (20, 5, 0, False),
+])
+def test_context_reseed_checks_own_cap_and_optional_caller_budget(
+    mock_tokenizer, context_cap, remaining, reserve, accepted,
+):
+    model, _ = _make_model_with_mock_client(
+        mock_tokenizer, max_trajectory_tokens=context_cap, token_budget_scope="context",
+    )
+    model.token_manager.add_prompt(list(range(30)))
+    model.message_count = 3
+    model.image_data = ["original image"]
+    # Even a pending reseed cannot bypass the full render or be consumed by a refused reseed.
+    model._generate_from_window_next = True
+    model._last_system_prompt = "system instructions"
+    model._last_tool_specs = [{"name": "done", "description": "Finish", "inputSchema": {"json": {}}}]
+    messages = [{"role": "user", "content": [{"text": "problem"}]}]
+    assert model.compact_reseed(
+        messages, remaining_budget=remaining, min_remaining_tokens=reserve,
+    ) is accepted
+    rendered = mock_tokenizer.apply_chat_template.call_args
+    assert rendered.args[0][0] == {"role": "system", "content": "system instructions"}
+    assert rendered.kwargs["tools"][0]["function"]["name"] == "done"
+    assert model._generate_from_window_next is True
+    assert model.image_data == ["original image"]
+    if accepted:
+        assert model.token_manager.active_base_offset == 30
+        assert model.message_count == 1
+        assert model._capture_seed_routing_next is True
+    else:
+        assert model.token_manager.token_ids == list(range(30))
+        assert model.token_manager.trajectory_segment_bounds == [(0, 30)]
+        assert model.trajectory_segment_call_starts == [0]
+        assert model.message_count == 3
+        assert model._capture_seed_routing_next is False
+
+
+def test_invalid_budget_scope_rejected_without_mutating_config(mock_tokenizer):
+    with pytest.raises(ValueError, match="token_budget_scope"):
+        _make_model_with_mock_client(mock_tokenizer, token_budget_scope="invalid")
+    model, _ = _make_model_with_mock_client(mock_tokenizer, token_budget_scope="context")
+    with pytest.raises(ValueError, match="token_budget_scope"):
+        model.update_config(token_budget_scope="invalid")
+    assert model.get_config()["token_budget_scope"] == "context"
+
+
+@pytest.mark.parametrize("remaining,reserve,accepted", [(4, 0, False), (5, 0, False), (6, 0, True),
+                                                        (8, 4, False), (9, 4, True), (None, 4096, True)])
+def test_compaction_reserves_generation_budget_before_installing_seed(model, mock_tokenizer, remaining, reserve, accepted):
+    model.token_manager.add_prompt([10, 11])
+    model.token_manager.add_response([12], [-0.1])
+    model.message_count = 3
+    model._last_system_prompt = "system instructions"
+    model._last_tool_specs = [{"name": "done", "description": "Finish", "inputSchema": {"json": {"type": "object"}}}]
+    messages = [{"role": "user", "content": [{"text": "problem"}]},
+                {"role": "assistant", "content": [{"text": "summary"}]}]
+    # The complete rendered seed contains five tokens, including all context framing.
+    assert model.compact_reseed(messages, remaining_budget=remaining, min_remaining_tokens=reserve) is accepted
+    rendered = mock_tokenizer.apply_chat_template.call_args
+    assert rendered.args[0][0] == {"role": "system", "content": "system instructions"}
+    assert rendered.kwargs["tools"][0]["function"]["name"] == "done"
+    if accepted:
+        assert model.token_manager.token_ids == [10, 11, 12, 1, 2, 3, 4, 5]
+        assert model.token_manager.trajectory_segment_bounds == [(0, 3), (3, 8)]
+        assert model.message_count == 2
+        assert model._generate_from_window_next and model._capture_seed_routing_next
+    else:
+        assert model.token_manager.token_ids == [10, 11, 12]
+        assert model.token_manager.trajectory_segment_bounds == [(0, 3)]
+        assert model.message_count == 3
+        assert model.trajectory_segment_call_starts == [0]
+        assert not model._generate_from_window_next and not model._capture_seed_routing_next

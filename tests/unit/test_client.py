@@ -17,6 +17,7 @@
 import asyncio
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
@@ -31,6 +32,109 @@ from strands_sglang.exceptions import (
     SGLangHTTPError,
     SGLangThrottledError,
 )
+
+
+class TestMutableRequestDeadline:
+    @pytest.mark.parametrize("cancel_request", [False, True])
+    async def test_generate_drains_watchdog_on_completion_or_cancellation(self, cancel_request):
+        from strands_sglang.client import request_deadline
+
+        started = asyncio.Event()
+        drained = asyncio.Event()
+
+        async def watchdog(*args):
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                drained.set()
+
+        async def response_json(**kwargs):
+            await started.wait()
+            if cancel_request:
+                await asyncio.Event().wait()
+            return {"text": "partial", "output_ids": [1]}
+
+        client = SGLangClient(base_url="http://localhost:30000")
+        client._abort_at_deadline = watchdog
+        response = MagicMock()
+        response.json = response_json
+
+        async def response_read():
+            return json.dumps(await response_json()).encode()
+
+        response.read = response_read
+        response.status = 200
+        session = MagicMock()
+        session.post.return_value.__aenter__ = AsyncMock(return_value=response)
+        session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+        session.closed = False
+        client._session = session
+        token = request_deadline.set(SimpleNamespace(expires_at=time.monotonic() + 100))
+        try:
+            task = asyncio.create_task(client.generate([1]))
+            await started.wait()
+            if cancel_request:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                assert (await task)["text"] == "partial"
+        finally:
+            request_deadline.reset(token)
+        assert drained.is_set()
+
+    async def test_watchdog_rechecks_renewed_deadline_before_abort(self, monkeypatch):
+        import strands_sglang.client as client_module
+
+        clock = SimpleNamespace(now=0.0)
+        deadline = SimpleNamespace(expires_at=10.0)
+        delays = []
+
+        async def sleep(delay):
+            delays.append(delay)
+            if len(delays) == 1:
+                # A successful compaction renews the same object while a child
+                # watchdog is asleep; the old expiry must not issue an abort.
+                clock.now = 10.0
+                deadline.expires_at = 19.0
+            else:
+                clock.now = 19.0
+
+        monkeypatch.setattr(client_module, "time", SimpleNamespace(monotonic=lambda: clock.now))
+        monkeypatch.setattr(client_module, "asyncio", SimpleNamespace(sleep=sleep, CancelledError=asyncio.CancelledError))
+        client = SGLangClient(base_url="http://localhost:30000")
+        response = MagicMock()
+        response.read = AsyncMock()
+        session = MagicMock()
+        session.post.return_value.__aenter__ = AsyncMock(return_value=response)
+        session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+        client._session = session
+        session.closed = False
+        state = {}
+        await client._abort_at_deadline("one-request", deadline, {"sticky": "episode"}, state)
+
+        assert delays == [10.0, 9.0]
+        session.post.assert_called_once_with(
+            "/abort_request", json={"rid": "one-request"}, headers={"sticky": "episode"}
+        )
+        assert state == {"deadline_aborted": True}
+
+    async def test_watchdog_retains_fixed_float_deadlines(self, monkeypatch):
+        import strands_sglang.client as client_module
+
+        monkeypatch.setattr(client_module, "time", SimpleNamespace(monotonic=lambda: 10.0))
+        client = SGLangClient(base_url="http://localhost:30000")
+        response = MagicMock()
+        response.read = AsyncMock()
+        session = MagicMock()
+        session.post.return_value.__aenter__ = AsyncMock(return_value=response)
+        session.post.return_value.__aexit__ = AsyncMock(return_value=False)
+        session.closed = False
+        client._session = session
+        await client._abort_at_deadline("fixed", 9.0, None, {})
+        session.post.assert_called_once_with("/abort_request", json={"rid": "fixed"}, headers=None)
 
 
 class TestSGLangClientInit:

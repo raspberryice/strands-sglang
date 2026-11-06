@@ -437,3 +437,49 @@ class TestMaxParallelToolCalls:
         limiter.reset()
         assert limiter._parallel_call_count == 0
         assert limiter.cancelled_tool_call_count == 0
+
+
+# =============================================================================
+# Per-context limits (in-loop compaction)
+# =============================================================================
+
+
+def test_start_new_context_restarts_iteration_allowance_but_keeps_totals():
+    limiter = ToolLimiter(max_tool_iters=2)
+    _simulate_iteration(limiter)
+    limiter.start_new_context()
+    assert limiter.context_count == 2
+    assert limiter.tool_iter_count == 1
+    assert limiter.context_tool_iter_count == 0
+    # Two more complete iterations fit in the new context; the third raises.
+    _simulate_iteration(limiter)
+    with pytest.raises(MaxToolIterationsReachedError):
+        _simulate_iteration(limiter)
+    assert limiter.tool_iter_count == 3
+
+
+def test_start_new_context_restarts_call_allowance():
+    limiter = ToolLimiter(max_tool_calls=3)
+    _simulate_iteration(limiter, parallel_calls=2)
+    limiter.start_new_context()
+    assert limiter.context_tool_call_count == 0
+    _simulate_iteration(limiter, parallel_calls=2)
+    with pytest.raises(MaxToolCallsReachedError):
+        _simulate_iteration(limiter, parallel_calls=1)
+    assert limiter.tool_call_count == 5
+
+
+def test_without_new_context_limits_are_episode_wide():
+    limiter = ToolLimiter(max_tool_iters=2)
+    _simulate_iteration(limiter)
+    with pytest.raises(MaxToolIterationsReachedError):
+        _simulate_iteration(limiter)
+    assert limiter.context_count == 1
+
+
+def test_reset_clears_context_accounting():
+    limiter = ToolLimiter(max_tool_iters=1)
+    limiter.start_new_context()
+    limiter.reset()
+    assert limiter.context_count == 1
+    assert limiter.context_tool_iter_count == 0

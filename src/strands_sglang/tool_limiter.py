@@ -47,6 +47,8 @@ class ToolLimiter(HookProvider):
         - Multiple parallel tool calls in one model response count as a single iteration but as individual calls.
         - The limiter raises after the iteration completes (on tool result), ensuring a clean trajectory
           without requiring token truncation.
+        - Limits apply to the active context: `start_new_context()` (called after an in-loop
+          compaction reseed) restarts the allowance while the episode totals keep counting.
 
     Example:
         >>> limiter = ToolLimiter(max_tool_iters=5)
@@ -89,6 +91,30 @@ class ToolLimiter(HookProvider):
         self.tool_call_count = 0
         self._parallel_call_count = 0
         self.cancelled_tool_call_count = 0
+        self._context_iter_base = 0
+        self._context_call_base = 0
+        self.context_count = 1
+
+    def start_new_context(self) -> None:
+        """Give the next context a fresh iteration/call allowance.
+
+        Call after a successful in-loop compaction reseed. The episode totals
+        (`tool_iter_count`, `tool_call_count`) keep accumulating for metrics; only
+        the limits are measured from this point on.
+        """
+        self._context_iter_base = self.tool_iter_count
+        self._context_call_base = self.tool_call_count
+        self.context_count += 1
+
+    @property
+    def context_tool_iter_count(self) -> int:
+        """Iterations completed in the active context."""
+        return self.tool_iter_count - self._context_iter_base
+
+    @property
+    def context_tool_call_count(self) -> int:
+        """Tool calls made in the active context."""
+        return self.tool_call_count - self._context_call_base
 
     def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
         """Register hooks with the strands agent."""
@@ -125,13 +151,13 @@ class ToolLimiter(HookProvider):
         # Check limit when tool result arrives (iteration complete)
         elif message.get("role") == "user":
             if any(c.get("toolResult") for c in content):
-                if self.max_tool_iters is not None and self.tool_iter_count >= self.max_tool_iters:
+                if self.max_tool_iters is not None and self.context_tool_iter_count >= self.max_tool_iters:
                     logger.debug("Max tool iterations (%d) reached, stopping", self.max_tool_iters)
                     raise MaxToolIterationsReachedError(
                         f"Max tool iterations ({self.max_tool_iters}) reached"
                         " (parallel tool calls count as one iteration)"
                     )
-                if self.max_tool_calls is not None and self.tool_call_count >= self.max_tool_calls:
+                if self.max_tool_calls is not None and self.context_tool_call_count >= self.max_tool_calls:
                     logger.debug("Max tool calls (%d) reached, stopping", self.max_tool_calls)
                     raise MaxToolCallsReachedError(
                         f"Max tool calls ({self.max_tool_calls}) reached"

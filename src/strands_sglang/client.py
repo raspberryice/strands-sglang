@@ -22,7 +22,8 @@ import logging
 import time
 import uuid
 from contextvars import ContextVar
-from typing import Any
+from contextlib import suppress
+from typing import Any, Protocol
 
 import aiohttp
 
@@ -66,12 +67,20 @@ from .exceptions import (
 # from asyncio so concurrent episodes can set different headers safely.
 request_headers: ContextVar[dict[str, str] | None] = ContextVar("sglang_request_headers", default=None)
 
-# Per-task `time.monotonic()` deadline that bounds the retry budget for `/generate`
-# calls. Set by the caller (e.g., Slime's agent bridge) to `time.monotonic() +
-# trajectory_timeout` once per trajectory; the retry loop checks it before each
-# attempt and bails with `SGLangConnectionError` rather than burning the rest of
-# the trajectory budget on retries. None = no deadline (legacy behavior).
-request_deadline: ContextVar[float | None] = ContextVar("sglang_request_deadline", default=None)
+class MutableDeadline(Protocol):
+    """Caller-owned monotonic deadline shared across nested asyncio tasks."""
+
+    expires_at: float
+
+
+def _deadline_time(deadline: float | MutableDeadline) -> float:
+    return deadline if isinstance(deadline, (float, int)) else deadline.expires_at
+
+
+# A fixed monotonic deadline or a caller-owned mutable deadline. Compaction can
+# renew the latter in place, so existing child tasks observe the same expiry.
+# None preserves the legacy unlimited request/retry behavior.
+request_deadline: ContextVar[float | MutableDeadline | None] = ContextVar("sglang_request_deadline", default=None)
 
 # Per-task mutable dict the caller (Slime's agent bridge) creates once per trajectory
 # and passes down via `abort_state.set({})`. The `/generate` deadline watchdog sets
@@ -250,7 +259,7 @@ class SGLangClient:
     async def _abort_at_deadline(
         self,
         rid: str,
-        deadline: float,
+        deadline: float | MutableDeadline,
         extra_headers: dict[str, str] | None,
         abort_state_dict: dict | None,
     ) -> None:
@@ -269,9 +278,12 @@ class SGLangClient:
         abort routes to the same engine holding `rid`.
         """
         try:
-            delay = deadline - time.monotonic()
-            if delay > 0:
+            while True:
+                delay = _deadline_time(deadline) - time.monotonic()
+                if delay <= 0:
+                    break
                 await asyncio.sleep(delay)
+                # The context may have been renewed while this watchdog slept.
             session = self._get_session()
             async with session.post("/abort_request", json={"rid": rid}, headers=extra_headers) as resp:
                 await resp.read()
@@ -367,7 +379,7 @@ class SGLangClient:
 
                 # Decide: retry, or bail (budget exhausted or deadline elapsed)
                 error_detail = str(last_error)
-                deadline_exceeded = deadline is not None and time.monotonic() >= deadline
+                deadline_exceeded = deadline is not None and time.monotonic() >= _deadline_time(deadline)
                 if attempt < self.max_retries and not deadline_exceeded:
                     logger.warning(
                         "SGLang request failed (attempt %d/%d): %s: %s. Retrying in %ss...",
@@ -401,6 +413,8 @@ class SGLangClient:
         finally:
             if watchdog is not None and not watchdog.done():
                 watchdog.cancel()
+                with suppress(asyncio.CancelledError):
+                    await watchdog
 
     async def health(self) -> bool:
         """Check if SGLang server is healthy."""
